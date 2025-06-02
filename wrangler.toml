@@ -1,0 +1,13 @@
+name = "dice-mcp-server"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+node_compat = true
+
+# KV Namespace - will be created during setup
+[[kv_namespaces]]
+binding = "DICE_KV"
+id = "c87cf7076b9f4d1793bccc59a9f762cd"
+
+[dev]
+port = 8787
+local_protocol = "http"
