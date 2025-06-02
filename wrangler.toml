@@ -1,5 +1,6 @@
 name = "dice-mcp-server"
 main = "src/index.ts"
+account_id = "4c82769bc8b746a321b75014c6983bb8"
 compatibility_date = "2024-01-01"
 compatibility_flags = ["nodejs_compat"]
 
