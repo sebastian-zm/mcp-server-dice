@@ -556,16 +556,16 @@ export class DiceMCP extends McpAgent<Env, unknown, AuthContext> {
     // Check for Cloudflare Access JWT
     const jwt = request.headers.get('Cf-Access-Jwt-Assertion');
     
-    if (jwt && this.context.env.ACCESS_AUD && this.context.env.ACCESS_TEAM_DOMAIN) {
-      const user = await verifyAccessJWT(jwt, this.context.env.ACCESS_AUD, this.context.env.ACCESS_TEAM_DOMAIN);
-      if (user) {
-        return {
-          user: { id: user.sub, email: user.email },
-          isAuthenticated: true,
-          rateLimitKey: `user:${user.sub}`
-        };
-      }
-    }
+    // if (jwt && this.context.env.ACCESS_AUD && this.context.env.ACCESS_TEAM_DOMAIN) {
+    //   const user = await verifyAccessJWT(jwt, this.context.env.ACCESS_AUD, this.context.env.ACCESS_TEAM_DOMAIN);
+    //   if (user) {
+    //     return {
+    //       user: { id: user.sub, email: user.email },
+    //       isAuthenticated: true,
+    //       rateLimitKey: `user:${user.sub}`
+    //     };
+    //   }
+    // }
 
     // Fall back to IP-based rate limiting
     const clientIP = this.getClientIP(request);

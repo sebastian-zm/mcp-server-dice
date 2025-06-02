@@ -9,6 +9,12 @@ compatibility_flags = ["nodejs_compat"]
 binding = "DICE_KV"
 id = "c87cf7076b9f4d1793bccc59a9f762cd"
 
+# Custom domain configuration
+[env.production]
+routes = [
+  { pattern = "dice.sebastian.software/*", zone_name = "sebastian.software" }
+]
+
 [dev]
 port = 8787
 local_protocol = "http"
