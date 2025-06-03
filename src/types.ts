@@ -1,6 +1,8 @@
 export type Env = {
   // Optional KV for future use
   DICE_KV?: KVNamespace;
+  // Durable Object for SSE connections
+  SSE_CONNECTIONS: DurableObjectNamespace;
 }
 
 export type DiceModifiers = {

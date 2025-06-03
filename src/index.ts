@@ -2,6 +2,7 @@ import { Env } from './types';
 import { McpDiceServer } from './mcp-server';
 import { SSEMcpTransport } from './sse-transport';
 import { getCorsHeaders, getBaseUrl } from './utils';
+import { SSEConnectionDurableObject } from './sse-durable-object';
 
 // Main Cloudflare Worker
 export default {
@@ -65,17 +66,22 @@ export default {
       }
     }
 
-    // SSE MCP endpoint (for legacy applications)
-    if (pathname === '/sse') {
-      const sseTransport = new SSEMcpTransport();
+    // SSE MCP endpoint using Durable Objects
+    if (pathname.startsWith('/sse')) {
+      // Get or create a unique session ID
+      const sessionId = url.searchParams.get('sessionId') || crypto.randomUUID();
       
-      if (request.method === 'GET') {
-        // Establish SSE connection
-        return sseTransport.handleSSEConnection(request);
-      } else if (request.method === 'POST') {
-        // Handle legacy POST-based messages
-        return sseTransport.handleSSEMessage(request);
-      }
+      // Get the Durable Object instance
+      const id = env.SSE_CONNECTIONS.idFromName(sessionId);
+      const durableObject = env.SSE_CONNECTIONS.get(id);
+      
+      // Route to the appropriate Durable Object endpoint
+      const subPath = pathname.substring(4); // Remove '/sse' prefix
+      const newUrl = new URL(request.url);
+      newUrl.pathname = subPath || '/events';
+      
+      // Forward the request to the Durable Object
+      return durableObject.fetch(newUrl, request);
     }
 
     // Health check endpoint
@@ -135,11 +141,17 @@ export default {
             content_type: "application/json"
           },
           sse_transport: {
-            description: "MCP over Server-Sent Events",
-            endpoint: `${baseUrl}/sse`,
-            method_connect: "GET",
-            method_message: "POST (legacy) or data: events",
-            content_type: "text/event-stream"
+            description: "MCP over Server-Sent Events (polling-based)",
+            endpoints: {
+              send: `${baseUrl}/sse/send?sessionId=YOUR_SESSION_ID`,
+              events: `${baseUrl}/sse/events?sessionId=YOUR_SESSION_ID&lastEventId=0`,
+              clear: `${baseUrl}/sse/clear?sessionId=YOUR_SESSION_ID`
+            },
+            method_send: "POST",
+            method_events: "GET (poll for new events)",
+            method_clear: "POST (clear session)",
+            polling_interval: "Recommended: 1-5 seconds",
+            session_id: "Use the same sessionId for all related requests"
           }
         },
         dice_notation: {
@@ -170,3 +182,6 @@ export default {
     });
   },
 };
+
+// Export Durable Object class
+export { SSEConnectionDurableObject };

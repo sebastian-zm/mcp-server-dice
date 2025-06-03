@@ -3,6 +3,15 @@ main = "src/index.ts"
 compatibility_date = "2024-12-04"
 compatibility_flags = ["nodejs_compat"]
 
+# Durable Objects configuration
+[[durable_objects.bindings]]
+name = "SSE_CONNECTIONS"
+class_name = "SSEConnectionDurableObject"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["SSEConnectionDurableObject"]
+
 
 # Optional: Custom domain configuration
 [env.production]
