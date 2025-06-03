@@ -1,6 +1,5 @@
 name = "dice-mcp-server"
 main = "src/index.ts"
-account_id = "4c82769bc8b746a321b75014c6983bb8"
 compatibility_date = "2024-12-04"
 compatibility_flags = ["nodejs_compat"]
 
@@ -9,12 +8,23 @@ compatibility_flags = ["nodejs_compat"]
 binding = "DICE_KV"
 id = "c87cf7076b9f4d1793bccc59a9f762cd"
 
-# Custom domain configuration
+# Durable Objects binding
+[[durable_objects.bindings]]
+name = "DICE_MCP"
+class_name = "DiceMCP"
+
+# Migration for SQLite-backed Durable Objects (Works on FREE plan!)
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["DiceMCP"]  # This enables SQLite storage
+
+# Optional: Custom domain configuration
 [env.production]
 routes = [
   { pattern = "dice.sebastian.software/*", zone_name = "sebastian.software" }
 ]
 
+# Development settings
 [dev]
 port = 8787
 local_protocol = "http"
