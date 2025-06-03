@@ -786,13 +786,9 @@ export default {
 
         console.log('GET request passed auth, sending SSE connection');
         
-        // Send initial SSE connection for Claude.ai integrations
-        const sseData = [
-          'data: {"type":"connection","status":"connected"}\n\n',
-          'data: {"type":"server_info","name":"Dice Rolling Server","version":"2.0.0"}\n\n'
-        ].join('');
-
-        return new Response(sseData, {
+        // Send minimal SSE connection for Claude.ai integrations
+        // Just establish the connection without custom messages
+        return new Response('', {
           headers: {
             'Content-Type': 'text/event-stream',
             'Cache-Control': 'no-cache',
