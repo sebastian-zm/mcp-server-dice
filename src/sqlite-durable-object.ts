@@ -86,6 +86,125 @@ export class SQLiteDurableObject {
       });
     }
 
+    // Handle POST to /stream endpoint (Claude Code sends messages here)
+    if (pathname === '/stream' && request.method === 'POST') {
+      console.log('[DO] Processing message via /stream POST');
+      try {
+        const message = await request.json();
+        console.log('[DO] Received message:', JSON.stringify(message, null, 2));
+        
+        const response = await this.mcpServer.handleRequest(message);
+        console.log('[DO] MCP response:', response ? 'Message generated' : 'No response (notification)');
+        
+        if (response !== null) {
+          // Get and increment last event ID
+          console.log('[DO] Incrementing event ID...');
+          const result = await this.db.prepare(
+            `UPDATE metadata SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) 
+             WHERE key = 'lastEventId' 
+             RETURNING value`
+          ).first();
+          
+          const eventId = result?.value || '1';
+          console.log(`[DO] New event ID: ${eventId}`);
+          
+          // Store the message
+          console.log('[DO] Storing message in database...');
+          await this.db.prepare(
+            `INSERT INTO messages (id, message, timestamp) VALUES (?, ?, ?)`
+          ).bind(eventId, JSON.stringify(response), Date.now()).run();
+          console.log('[DO] Message stored successfully');
+          
+          // Clean up old messages
+          const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
+          await this.db.prepare(`
+            DELETE FROM messages 
+            WHERE timestamp < ? 
+            AND id NOT IN (
+              SELECT id FROM messages 
+              ORDER BY id DESC 
+              LIMIT 100
+            )
+          `).bind(fiveMinutesAgo).run();
+        }
+        
+        // Return empty response for POST
+        return new Response('', {
+          status: 204,
+          headers: getCorsHeaders()
+        });
+        
+      } catch (error: any) {
+        console.error('[DO] Error processing /stream POST:', error);
+        return new Response(JSON.stringify({
+          error: error.message
+        }), {
+          status: 400,
+          headers: { 
+            'Content-Type': 'application/json',
+            ...getCorsHeaders()
+          }
+        });
+      }
+    }
+    
+    // Standard SSE stream endpoint for Claude Code
+    if (pathname === '/stream' && request.method === 'GET') {
+      console.log('[DO] Processing SSE stream connection');
+      
+      const encoder = new TextEncoder();
+      let intervalId: number | null = null;
+      
+      const stream = new ReadableStream({
+        async start(controller) {
+          // Send initial connection message
+          controller.enqueue(encoder.encode(': Connected to MCP Dice Server\n\n'));
+          
+          let lastEventId = '0';
+          
+          // Poll for new messages every second
+          intervalId = setInterval(async () => {
+            try {
+              const messages = await this.db.prepare(`
+                SELECT id, message, timestamp 
+                FROM messages 
+                WHERE CAST(id AS INTEGER) > CAST(? AS INTEGER)
+                ORDER BY id ASC
+                LIMIT 10
+              `).bind(lastEventId).all();
+              
+              if (messages.results && messages.results.length > 0) {
+                for (const event of messages.results) {
+                  const data = `id: ${event.id}\ndata: ${event.message}\n\n`;
+                  controller.enqueue(encoder.encode(data));
+                  lastEventId = event.id;
+                  console.log(`[DO] Sent event ${event.id} via SSE stream`);
+                }
+              }
+            } catch (error) {
+              console.error('[DO] Error in SSE stream:', error);
+              controller.error(error);
+              if (intervalId) clearInterval(intervalId);
+            }
+          }, 1000) as unknown as number;
+        },
+        
+        cancel() {
+          console.log('[DO] SSE stream cancelled');
+          if (intervalId) clearInterval(intervalId);
+        }
+      });
+      
+      return new Response(stream, {
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+          ...getCorsHeaders()
+        }
+      });
+    }
+
     if (pathname === '/send' && request.method === 'POST') {
       console.log('[DO] Processing /send request');
       try {

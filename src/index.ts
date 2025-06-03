@@ -96,8 +96,15 @@ export default {
       // Route to the appropriate Durable Object endpoint
       const subPath = pathname.substring(4); // Remove '/sse' prefix
       const newUrl = new URL(request.url);
-      newUrl.pathname = subPath || '/events';
-      console.log(`[SSE] Forwarding to DO path: ${newUrl.pathname}`);
+      
+      // If no subpath, this is a standard SSE connection
+      if (!subPath || subPath === '/') {
+        newUrl.pathname = '/stream';
+        console.log(`[SSE] Standard SSE connection, forwarding to /stream`);
+      } else {
+        newUrl.pathname = subPath;
+        console.log(`[SSE] Forwarding to DO path: ${newUrl.pathname}`);
+      }
       
       // Forward the request to the Durable Object
       return durableObject.fetch(newUrl, request);
