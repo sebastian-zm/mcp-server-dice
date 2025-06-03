@@ -3,20 +3,6 @@ main = "src/index.ts"
 compatibility_date = "2024-12-04"
 compatibility_flags = ["nodejs_compat"]
 
-# Add Durable Object binding
-[[durable_objects.bindings]]
-name = "DICE_MCP_CONNECTIONS"
-class_name = "DiceMCPConnections"
-
-# Migration to add new Durable Objects
-[[migrations]]
-tag = "v3"
-new_classes = ["DiceMCPConnections"]
-
-# Previous migration to remove old DO
-[[migrations]]
-tag = "v2"
-deleted_classes = ["DiceMCP"]
 
 # Optional: Custom domain configuration
 [env.production]
