@@ -1,9 +1,3 @@
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 interface Env {
@@ -21,7 +15,22 @@ interface AuthContext {
   rateLimitKey: string;
 }
 
-// Keep all the existing DiceParser and helper classes unchanged
+interface DiceModifiers {
+  keep?: number;
+  drop?: number;
+  explode?: boolean;
+  explodeOn?: number;
+  reroll?: number;
+}
+
+interface DiceResult {
+  total: number;
+  rolls: number[];
+  expression: string;
+  breakdown: string;
+}
+
+// Dice notation parser
 class DiceParser {
   private position = 0;
   private input = "";
@@ -39,7 +48,7 @@ class DiceParser {
         throw new Error(`Unexpected character at position ${this.position}: '${this.input[this.position]}'`);
       }
       return result;
-    } catch (error) {
+    } catch (error: any) {
       throw new Error(`Parse error: ${error.message}`);
     }
   }
@@ -319,21 +328,6 @@ class DiceParser {
   }
 }
 
-interface DiceModifiers {
-  keep?: number;
-  drop?: number;
-  explode?: boolean;
-  explodeOn?: number;
-  reroll?: number;
-}
-
-interface DiceResult {
-  total: number;
-  rolls: number[];
-  expression: string;
-  breakdown: string;
-}
-
 // Simple MCP server without Durable Objects
 class DiceMCPServer {
   private parser = new DiceParser();
@@ -375,17 +369,17 @@ class DiceMCPServer {
                   // Send response via SSE
                   await writer.write(new TextEncoder().encode('event: message\n'));
                   await writer.write(new TextEncoder().encode(`data: ${JSON.stringify(response)}\n\n`));
-                } catch (parseError) {
+                } catch (parseError: any) {
                   console.error('Failed to parse SSE message:', parseError);
                 }
               }
             }
-          } catch (bodyError) {
+          } catch (bodyError: any) {
             console.error('Failed to read SSE request body:', bodyError);
           }
         }
 
-      } catch (error) {
+      } catch (error: any) {
         console.error('SSE error:', error);
       } finally {
         await writer.close();
@@ -407,7 +401,7 @@ class DiceMCPServer {
     });
   }
 
-  async handleMCPMessage(message: any): Promise<any> {
+  async handleMCPMessage(message: any, request?: Request): Promise<any> {
     try {
       console.log('📨 MCP Message:', JSON.stringify(message, null, 2));
 
@@ -458,7 +452,7 @@ class DiceMCPServer {
           };
         
         case 'tools/call':
-          const toolResult = await this.handleToolCall(message.params);
+          const toolResult = await this.handleToolCall(message.params, request);
           return {
             jsonrpc: "2.0",
             result: toolResult,
@@ -499,7 +493,7 @@ class DiceMCPServer {
             id: message.id
           };
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error('❌ MCP message error:', error);
       return {
         jsonrpc: "2.0",
@@ -513,31 +507,49 @@ class DiceMCPServer {
     }
   }
 
-  async handleToolCall(params: any): Promise<any> {
+  async handleToolCall(params: any, request?: Request): Promise<any> {
     try {
       const { name, arguments: args } = params;
 
       switch (name) {
         case 'roll':
-          return await this.executeRollTool(args);
+          return await this.executeRollTool(args, request);
         
         case 'rate_limit_status':
-          return await this.executeRateLimitStatus();
+          return await this.executeRateLimitStatus(request);
         
         default:
           throw new Error(`Unknown tool: ${name}`);
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error('❌ Tool call error:', error);
       throw error;
     }
   }
 
-  private async executeRollTool(args: any): Promise<any> {
+  private async executeRollTool(args: any, request?: Request): Promise<any> {
     const { expression, description } = args;
     console.log(`🎲 Rolling: ${expression}`);
 
     try {
+      // Check rate limits first if we have request info
+      if (request) {
+        const clientIP = this.getClientIP(request);
+        const rateLimitKey = `ip:${clientIP}`;
+        const rateLimitCheck = await this.checkRateLimit(rateLimitKey);
+        
+        if (rateLimitCheck.limited) {
+          return {
+            content: [
+              {
+                type: "text", 
+                text: `⚠️ **Rate limit exceeded**\n\n${rateLimitCheck.reason}\n\nTry again in ${rateLimitCheck.resetIn} seconds.\n\nUse the \`rate_limit_status\` tool to check your current usage.`
+              }
+            ]
+          };
+        }
+      }
+
       const result = this.parser.parse(expression);
 
       let output = `🎲 **${result.expression}**`;
@@ -564,7 +576,7 @@ class DiceMCPServer {
         ]
       };
 
-    } catch (error) {
+    } catch (error: any) {
       console.error('❌ Dice roll error:', error);
       return {
         content: [
@@ -577,44 +589,129 @@ class DiceMCPServer {
     }
   }
 
-  private async executeRateLimitStatus(): Promise<any> {
-    // Simplified rate limit status
-    return {
-      content: [
-        {
-          type: "text",
-          text: `🎲 **Rate Limit Status**\n\nAccess: Available\nLimits: 50 rolls/minute, 2,000 rolls/hour, 10,000 rolls/day\n\n✅ Service operational`
-        }
-      ]
-    };
+  private async executeRateLimitStatus(request?: Request): Promise<any> {
+    try {
+      // Get client identifier (IP-based for now)
+      const clientIP = request ? this.getClientIP(request) : 'unknown';
+      const rateLimitKey = `ip:${clientIP}`;
+      
+      const now = Date.now();
+      const minuteKey = `rate_limit_minute:${rateLimitKey}:${Math.floor(now / 60000)}`;
+      const hourKey = `rate_limit_hour:${rateLimitKey}:${Math.floor(now / 3600000)}`;
+      const dayKey = `rate_limit_day:${rateLimitKey}:${Math.floor(now / 86400000)}`;
+
+      // Rate limits
+      const limits = {
+        minute: 50,
+        hour: 2000,
+        day: 10000
+      };
+
+      // Get current usage from KV store
+      const [minuteCount, hourCount, dayCount] = await Promise.all([
+        this.env.DICE_KV.get(minuteKey).then(v => v ? parseInt(v) : 0),
+        this.env.DICE_KV.get(hourKey).then(v => v ? parseInt(v) : 0),
+        this.env.DICE_KV.get(dayKey).then(v => v ? parseInt(v) : 0)
+      ]);
+
+      // Calculate remaining limits
+      const remaining = {
+        minute: Math.max(0, limits.minute - minuteCount),
+        hour: Math.max(0, limits.hour - hourCount),
+        day: Math.max(0, limits.day - dayCount)
+      };
+
+      // Calculate reset times
+      const resetTimes = {
+        minute: 60 - (Math.floor(now / 1000) % 60),
+        hour: Math.ceil((3600000 - (now % 3600000)) / 1000),
+        day: Math.ceil((86400000 - (now % 86400000)) / 1000)
+      };
+
+      // Format reset times
+      const formatTime = (seconds: number): string => {
+        if (seconds < 60) return `${seconds}s`;
+        if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+        const hours = Math.floor(seconds / 3600);
+        const minutes = Math.floor((seconds % 3600) / 60);
+        return `${hours}h ${minutes}m`;
+      };
+
+      // Create status message
+      let statusText = `🎲 **Rate Limit Status**\n\n`;
+      statusText += `**Client:** ${clientIP}\n`;
+      statusText += `**Access:** ${clientIP !== 'unknown' ? 'IP-based tracking' : 'Limited tracking'}\n\n`;
+      
+      statusText += `**Current Usage:**\n`;
+      statusText += `• **This minute**: ${minuteCount}/${limits.minute} rolls\n`;
+      statusText += `• **This hour**: ${hourCount}/${limits.hour} rolls\n`;
+      statusText += `• **Today**: ${dayCount}/${limits.day} rolls\n\n`;
+      
+      statusText += `**Remaining:**\n`;
+      statusText += `• **This minute**: ${remaining.minute} rolls (resets in ${formatTime(resetTimes.minute)})\n`;
+      statusText += `• **This hour**: ${remaining.hour} rolls (resets in ${formatTime(resetTimes.hour)})\n`;
+      statusText += `• **Today**: ${remaining.day} rolls (resets in ${formatTime(resetTimes.day)})\n\n`;
+
+      // Add status indicators
+      if (remaining.minute === 0) {
+        statusText += `⚠️ **Minute limit reached** - wait ${formatTime(resetTimes.minute)}\n`;
+      } else if (remaining.hour === 0) {
+        statusText += `⚠️ **Hourly limit reached** - wait ${formatTime(resetTimes.hour)}\n`;
+      } else if (remaining.day === 0) {
+        statusText += `⚠️ **Daily limit reached** - wait ${formatTime(resetTimes.day)}\n`;
+      } else {
+        statusText += `✅ **Service available** - you can make ${Math.min(remaining.minute, remaining.hour, remaining.day)} more rolls\n`;
+      }
+
+      // Add percentage usage bars
+      const getUsageBar = (used: number, total: number): string => {
+        const percentage = Math.round((used / total) * 100);
+        const filled = Math.round(percentage / 10);
+        const empty = 10 - filled;
+        return `[${'█'.repeat(filled)}${'░'.repeat(empty)}] ${percentage}%`;
+      };
+
+      statusText += `\n**Usage Visualization:**\n`;
+      statusText += `• Minute: ${getUsageBar(minuteCount, limits.minute)}\n`;
+      statusText += `• Hour: ${getUsageBar(hourCount, limits.hour)}\n`;
+      statusText += `• Day: ${getUsageBar(dayCount, limits.day)}`;
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: statusText
+          }
+        ]
+      };
+
+    } catch (error: any) {
+      console.error('❌ Rate limit status error:', error);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `❌ **Rate Limit Status Error**\n\nFailed to retrieve rate limit information: ${error.message}\n\nDefault limits: 50/min, 2,000/hour, 10,000/day`
+          }
+        ]
+      };
+    }
   }
+
+  async handleMCPRequest(request: Request): Promise<Response> {
     try {
       const body = await request.json();
       console.log('📨 MCP Request:', JSON.stringify(body, null, 2));
 
-      // Handle different MCP request types
-      switch (body.method) {
-        case 'tools/list':
-          return this.handleListTools();
-        
-        case 'tools/call':
-          return this.handleCallTool(body.params);
-        
-        default:
-          return new Response(JSON.stringify({
-            error: {
-              code: -32601,
-              message: `Method not found: ${body.method}`
-            },
-            id: body.id
-          }), {
-            status: 200,
-            headers: { 'Content-Type': 'application/json' }
-          });
-      }
-    } catch (error) {
+      const response = await this.handleMCPMessage(body);
+      
+      return new Response(JSON.stringify(response), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    } catch (error: any) {
       console.error('❌ MCP request error:', error);
       return new Response(JSON.stringify({
+        jsonrpc: "2.0",
         error: {
           code: -32603,
           message: 'Internal error',
@@ -626,8 +723,6 @@ class DiceMCPServer {
       });
     }
   }
-
-
 
   private getClientIP(request: Request): string {
     const headers = request.headers;
@@ -662,7 +757,7 @@ class DiceMCPServer {
       await this.env.DICE_KV.put(minuteKey, (count + 1).toString(), { expirationTtl: 120 });
       return { limited: false };
 
-    } catch (error) {
+    } catch (error: any) {
       console.error('Rate limit check failed:', error);
       return { limited: false }; // Allow on error
     }
@@ -678,7 +773,7 @@ export default {
       try {
         await env.DICE_KV.get('test-startup');
         console.log('✅ KV namespace accessible');
-      } catch (kvError) {
+      } catch (kvError: any) {
         console.error('❌ KV namespace error:', kvError);
         return new Response(JSON.stringify({
           error: 'KV namespace not accessible',
@@ -801,7 +896,7 @@ export default {
 
       return new Response('Not found', { status: 404 });
 
-    } catch (error) {
+    } catch (error: any) {
       console.error('💥 Main handler error:', error);
       
       return new Response(JSON.stringify({
