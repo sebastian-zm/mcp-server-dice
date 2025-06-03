@@ -119,6 +119,15 @@ class DiceServer {
         };
         break;
         
+      case 'prompts/list':
+        // Return empty prompts list (we don't have any prompts)
+        response = {
+          jsonrpc: "2.0",
+          id: message.id,
+          result: { prompts: [] }
+        };
+        break;
+        
       case 'tools/call':
         const toolName = message.params.name;
         const args = message.params.arguments || {};
@@ -766,7 +775,45 @@ export default {
 
     // MCP endpoint with Streamable HTTP transport
     if (pathname === '/mcp') {
-      if (request.method === 'POST') {
+      if (request.method === 'GET') {
+        // Claude.ai integrations start with GET to establish SSE connection
+        console.log('=== MCP GET REQUEST (SSE CONNECTION) ===');
+        console.log('Headers:', Object.fromEntries(request.headers.entries()));
+        
+        if (!validateAuth(request)) {
+          console.log('GET request failed auth validation');
+          return new Response('Unauthorized', { 
+            status: 401,
+            headers: {
+              'WWW-Authenticate': 'Bearer',
+              'Access-Control-Allow-Origin': '*',
+            }
+          });
+        }
+
+        console.log('Establishing SSE connection for Claude.ai integration');
+        
+        // Create a persistent SSE connection that stays open
+        const stream = new ReadableStream({
+          start(controller) {
+            // Send a comment to establish the connection
+            controller.enqueue(new TextEncoder().encode(': SSE connection established\n\n'));
+            
+            // Keep the connection alive - Claude.ai will send MCP messages somehow
+            // TODO: Figure out how Claude.ai sends the actual MCP protocol messages
+          }
+        });
+
+        return new Response(stream, {
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+          }
+        });
+      } else if (request.method === 'POST') {
         // Debug logging - temporarily log all requests
         const body = await request.text();
         console.log('=== MCP POST REQUEST ===');
@@ -781,13 +828,13 @@ export default {
         });
         return handleStreamableHTTPRequest(newRequest);
       } else {
-        // Log any non-POST requests to /mcp
+        // Log any other requests to /mcp
         console.log(`=== MCP ${request.method} REQUEST (NOT SUPPORTED) ===`);
         console.log('Headers:', Object.fromEntries(request.headers.entries()));
         return new Response(`Method ${request.method} not allowed`, { 
           status: 405,
           headers: {
-            'Allow': 'POST',
+            'Allow': 'GET, POST',
             'Access-Control-Allow-Origin': '*',
           }
         });
@@ -807,6 +854,24 @@ export default {
       }
 
       if (request.method === 'GET') {
+        // Debug logging for SSE GET requests
+        console.log('=== SSE GET REQUEST ===');
+        console.log('Headers:', Object.fromEntries(request.headers.entries()));
+        console.log('URL:', request.url);
+        
+        if (!validateAuth(request)) {
+          console.log('SSE GET request failed auth validation');
+          return new Response('Unauthorized', { 
+            status: 401,
+            headers: {
+              'WWW-Authenticate': 'Bearer',
+              'Access-Control-Allow-Origin': '*',
+            }
+          });
+        }
+
+        console.log('SSE GET request passed auth, sending SSE connection');
+        
         // Initial SSE connection - send a proper SSE response
         const sseData = [
           'data: {"type":"connection","status":"connected"}\n\n',
