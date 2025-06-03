@@ -767,8 +767,14 @@ export default {
     // MCP endpoint with Streamable HTTP transport
     if (pathname === '/mcp') {
       if (request.method === 'GET') {
+        // Debug logging for GET requests
+        console.log('=== MCP GET REQUEST ===');
+        console.log('Headers:', Object.fromEntries(request.headers.entries()));
+        console.log('URL:', request.url);
+        
         // Handle initial connection for Claude.ai integrations
         if (!validateAuth(request)) {
+          console.log('GET request failed auth validation');
           return new Response('Unauthorized', { 
             status: 401,
             headers: {
@@ -778,6 +784,8 @@ export default {
           });
         }
 
+        console.log('GET request passed auth, sending SSE connection');
+        
         // Send initial SSE connection for Claude.ai integrations
         const sseData = [
           'data: {"type":"connection","status":"connected"}\n\n',
@@ -796,7 +804,7 @@ export default {
       } else if (request.method === 'POST') {
         // Debug logging - temporarily log all requests
         const body = await request.text();
-        console.log('=== MCP REQUEST ===');
+        console.log('=== MCP POST REQUEST ===');
         console.log('Headers:', Object.fromEntries(request.headers.entries()));
         console.log('Body:', body);
         
