@@ -328,7 +328,7 @@ class DiceParser {
   }
 }
 
-// Simple MCP server without Durable Objects
+// Simple MCP server implementation
 class DiceMCPServer {
   private parser = new DiceParser();
   private env: Env;
@@ -337,66 +337,72 @@ class DiceMCPServer {
     this.env = env;
   }
 
+  // Fixed SSE implementation for MCP
   async handleSSERequest(request: Request): Promise<Response> {
     console.log('🌊 Setting up SSE connection for MCP');
     
-    // Create a readable stream for SSE
+    // Ensure this is a GET request for SSE establishment
+    if (request.method !== 'GET') {
+      return new Response('SSE endpoint only accepts GET requests', { status: 405 });
+    }
+
+    // Create SSE response with proper headers
+    const encoder = new TextEncoder();
+    
+    // Create the SSE stream
     const { readable, writable } = new TransformStream();
     const writer = writable.getWriter();
 
-    // Handle SSE connection
-    const handleSSE = async () => {
+    // Send initial MCP messages
+    const sendSSEMessage = async (data: any) => {
+      const message = `data: ${JSON.stringify(data)}\n\n`;
       try {
-        // Send initial connection message
-        await writer.write(new TextEncoder().encode('event: message\n'));
-        await writer.write(new TextEncoder().encode('data: {"jsonrpc": "2.0", "method": "initialized", "params": {}}\n\n'));
-
-        // Handle incoming messages if this is a POST request with a body
-        if (request.method === 'POST') {
-          try {
-            const body = await request.text();
-            console.log('📨 SSE Request body:', body);
-            
-            // Parse and handle MCP message
-            const lines = body.split('\n');
-            for (const line of lines) {
-              if (line.startsWith('data: ') && line.length > 6) {
-                const data = line.substring(6);
-                try {
-                  const message = JSON.parse(data);
-                  const response = await this.handleMCPMessage(message);
-                  
-                  // Send response via SSE
-                  await writer.write(new TextEncoder().encode('event: message\n'));
-                  await writer.write(new TextEncoder().encode(`data: ${JSON.stringify(response)}\n\n`));
-                } catch (parseError: any) {
-                  console.error('Failed to parse SSE message:', parseError);
-                }
-              }
-            }
-          } catch (bodyError: any) {
-            console.error('Failed to read SSE request body:', bodyError);
-          }
-        }
-
-      } catch (error: any) {
-        console.error('SSE error:', error);
-      } finally {
-        await writer.close();
+        await writer.write(encoder.encode(message));
+      } catch (error) {
+        console.error('Failed to write SSE message:', error);
       }
     };
 
-    // Start handling SSE in the background
-    handleSSE().catch(console.error);
+    // Handle SSE connection initialization
+    const initializeSSE = async () => {
+      try {
+        // Send connection established event
+        await sendSSEMessage({
+          jsonrpc: "2.0",
+          method: "connection.established",
+          params: {}
+        });
+
+        console.log('✅ SSE connection established');
+        
+        // Keep the connection alive (MCP over SSE doesn't auto-close)
+        // The actual MCP messages will come via POST to /mcp
+        
+      } catch (error: any) {
+        console.error('❌ SSE initialization error:', error);
+        try {
+          await writer.close();
+        } catch (closeError) {
+          console.error('Error closing writer:', closeError);
+        }
+      }
+    };
+
+    // Initialize the SSE connection
+    initializeSSE().catch(console.error);
 
     return new Response(readable, {
+      status: 200,
       headers: {
         'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
         'Connection': 'keep-alive',
         'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type, Cache-Control',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
+        'Access-Control-Allow-Headers': 'Content-Type, Cache-Control, Authorization',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Expose-Headers': 'Content-Type',
+        // Important: Disable buffering for SSE
+        'X-Accel-Buffering': 'no',
       }
     });
   }
@@ -703,10 +709,15 @@ class DiceMCPServer {
       const body = await request.json();
       console.log('📨 MCP Request:', JSON.stringify(body, null, 2));
 
-      const response = await this.handleMCPMessage(body);
+      const response = await this.handleMCPMessage(body, request);
       
       return new Response(JSON.stringify(response), {
-        headers: { 'Content-Type': 'application/json' }
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
+        }
       });
     } catch (error: any) {
       console.error('❌ MCP request error:', error);
@@ -719,7 +730,10 @@ class DiceMCPServer {
         }
       }), {
         status: 500,
-        headers: { 'Content-Type': 'application/json' }
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
       });
     }
   }
@@ -800,16 +814,19 @@ export default {
       // Create the dice server
       const diceServer = new DiceMCPServer(env);
 
-      // MCP endpoints
-      if (pathname.startsWith('/mcp')) {
-        console.log(`🔧 Handling MCP endpoint: ${pathname}`);
-        return diceServer.handleMCPRequest(request);
+      // SSE endpoint for MCP (GET only)
+      if (pathname === '/sse') {
+        console.log(`🔧 Handling SSE endpoint: ${pathname} (${request.method})`);
+        return diceServer.handleSSERequest(request);
       }
 
-      // SSE endpoint for MCP
-      if (pathname.startsWith('/sse')) {
-        console.log(`🔧 Handling SSE endpoint: ${pathname}`);
-        return diceServer.handleSSERequest(request);
+      // MCP endpoints (POST only)
+      if (pathname === '/mcp') {
+        console.log(`🔧 Handling MCP endpoint: ${pathname} (${request.method})`);
+        if (request.method !== 'POST') {
+          return new Response('MCP endpoint only accepts POST requests', { status: 405 });
+        }
+        return diceServer.handleMCPRequest(request);
       }
 
       // Root endpoint with server info
@@ -833,6 +850,12 @@ export default {
           endpoints: {
             mcp: request.url + "mcp",
             sse: request.url + "sse"
+          },
+          transport: {
+            type: "SSE (Server-Sent Events)",
+            sse_endpoint: request.url + "sse",
+            mcp_endpoint: request.url + "mcp",
+            note: "Use SSE for establishing connection, POST to /mcp for requests"
           },
           authentication: authInfo,
           rateLimits: {
@@ -890,7 +913,10 @@ export default {
           env: Object.keys(env),
           timestamp: new Date().toISOString()
         }), {
-          headers: { 'Content-Type': 'application/json' }
+          headers: { 
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+          }
         });
       }
 
