@@ -3,14 +3,25 @@ main = "src/index.ts"
 compatibility_date = "2024-12-04"
 compatibility_flags = ["nodejs_compat"]
 
-# Durable Objects configuration
+# D1 Database binding (for SQLite)
+[[d1_databases]]
+binding = "DB"
+database_name = "dice-mcp-db"
+database_id = "a7c36b49-7f91-4926-9887-4c882ec37c3f"
+
+# SQLite-based Durable Object
 [[durable_objects.bindings]]
-name = "SSE_CONNECTIONS"
-class_name = "SSEConnectionDurableObject"
+name = "SQLITE_DO"
+class_name = "SQLiteDurableObject"
 
 [[migrations]]
 tag = "v1"
 new_classes = ["SSEConnectionDurableObject"]
+
+[[migrations]]
+tag = "v2"
+deleted_classes = ["SSEConnectionDurableObject"]
+new_sqlite_classes = ["SQLiteDurableObject"]
 
 
 # Optional: Custom domain configuration

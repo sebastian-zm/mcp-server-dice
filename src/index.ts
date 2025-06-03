@@ -1,8 +1,7 @@
 import { Env } from './types';
 import { McpDiceServer } from './mcp-server';
-import { SSEMcpTransport } from './sse-transport';
 import { getCorsHeaders, getBaseUrl } from './utils';
-import { SSEConnectionDurableObject } from './sse-durable-object';
+import { SQLiteDurableObject } from './sqlite-durable-object';
 
 // Main Cloudflare Worker
 export default {
@@ -66,14 +65,27 @@ export default {
       }
     }
 
-    // SSE MCP endpoint using Durable Objects
+    // SSE MCP endpoint using SQLite Durable Object
     if (pathname.startsWith('/sse')) {
+      // Check if SQLite DO is configured
+      if (!env.SQLITE_DO || !env.DB) {
+        return new Response(JSON.stringify({
+          error: "SQLite Durable Object not configured. Please set up D1 database."
+        }), {
+          status: 500,
+          headers: {
+            'Content-Type': 'application/json',
+            ...getCorsHeaders()
+          }
+        });
+      }
+      
       // Get or create a unique session ID
       const sessionId = url.searchParams.get('sessionId') || crypto.randomUUID();
       
       // Get the Durable Object instance
-      const id = env.SSE_CONNECTIONS.idFromName(sessionId);
-      const durableObject = env.SSE_CONNECTIONS.get(id);
+      const id = env.SQLITE_DO.idFromName(sessionId);
+      const durableObject = env.SQLITE_DO.get(id);
       
       // Route to the appropriate Durable Object endpoint
       const subPath = pathname.substring(4); // Remove '/sse' prefix
@@ -184,4 +196,4 @@ export default {
 };
 
 // Export Durable Object class
-export { SSEConnectionDurableObject };
+export { SQLiteDurableObject };
