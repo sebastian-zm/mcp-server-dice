@@ -5,6 +5,7 @@ type Env = {
   DICE_KV?: KVNamespace; // Optional, not used without persistence
   ACCESS_AUD?: string;
   ACCESS_TEAM_DOMAIN?: string;
+  DICE_MCP_CONNECTIONS: DurableObjectNamespace; // Durable Object binding
 }
 
 // Simple stateless MCP server
@@ -486,8 +487,115 @@ type DiceResult = {
   breakdown: string;
 }
 
-// Global dice server instance
+// Global dice server instance for non-Durable Object requests
 const diceServer = new DiceServer();
+
+// Durable Object for handling persistent MCP connections
+export class DiceMCPConnections {
+  private state: DurableObjectState;
+  private env: Env;
+  private diceServer: DiceServer;
+
+  constructor(state: DurableObjectState, env: Env) {
+    this.state = state;
+    this.env = env;
+    this.diceServer = new DiceServer();
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const pathname = url.pathname;
+
+    console.log(`=== DURABLE OBJECT REQUEST === ${request.method} ${pathname}`);
+
+    // Handle SSE connection establishment
+    if (pathname === '/connect' && request.method === 'GET') {
+      return this.handleSSEConnection(request);
+    }
+
+    // Handle MCP message processing
+    if (pathname === '/message' && request.method === 'POST') {
+      return this.handleMCPMessage(request);
+    }
+
+    return new Response('Not found', { status: 404 });
+  }
+
+  private async handleSSEConnection(request: Request): Promise<Response> {
+    console.log('=== DURABLE OBJECT SSE CONNECTION ===');
+    console.log('Headers:', Object.fromEntries(request.headers.entries()));
+
+    // Create a persistent SSE connection
+    const { readable, writable } = new TransformStream();
+    const writer = writable.getWriter();
+    const encoder = new TextEncoder();
+
+    // Send initial connection message
+    writer.write(encoder.encode(': MCP SSE connection established\n\n'));
+
+    // Keep connection alive with periodic heartbeats
+    const heartbeat = setInterval(() => {
+      try {
+        writer.write(encoder.encode(': heartbeat\n\n'));
+      } catch (error) {
+        console.log('Client disconnected, clearing heartbeat');
+        clearInterval(heartbeat);
+      }
+    }, 30000); // 30 second heartbeat
+
+    // Handle client disconnect
+    request.signal?.addEventListener('abort', () => {
+      console.log('Client disconnected');
+      clearInterval(heartbeat);
+      writer.close();
+    });
+
+    return new Response(readable, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+      }
+    });
+  }
+
+  private async handleMCPMessage(request: Request): Promise<Response> {
+    console.log('=== DURABLE OBJECT MCP MESSAGE ===');
+    
+    try {
+      const message = await request.json();
+      console.log('MCP Message:', message);
+      
+      const response = await this.diceServer.handleMessage(message);
+      console.log('MCP Response:', response);
+
+      return new Response(JSON.stringify(response), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+        }
+      });
+    } catch (error: any) {
+      console.error('Error processing MCP message:', error);
+      return new Response(JSON.stringify({
+        jsonrpc: "2.0",
+        id: null,
+        error: {
+          code: -32700,
+          message: `Parse error: ${error.message}`
+        }
+      }), {
+        status: 400,
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+        }
+      });
+    }
+  }
+}
 
 // Helper function to get base URL
 function getBaseUrl(request: Request): string {
@@ -508,71 +616,6 @@ const validateAuth = (request: Request): boolean => {
   
   return false;
 };
-
-// Helper function to handle Streamable HTTP responses
-async function handleStreamableHTTPRequest(request: Request): Promise<Response> {
-  if (!validateAuth(request)) {
-    return new Response('Unauthorized', { 
-      status: 401,
-      headers: {
-        'WWW-Authenticate': 'Bearer',
-        'Access-Control-Allow-Origin': '*',
-      }
-    });
-  }
-
-  try {
-    let message;
-    const body = await request.text();
-    try {
-      message = JSON.parse(body);
-    } catch (parseError) {
-      throw new Error(`Invalid JSON: ${parseError}`);
-    }
-    
-    const response = await diceServer.handleMessage(message);
-    
-    // Handle notifications (no response needed)
-    if (response === null) {
-      return new Response('', { status: 204 });
-    }
-    
-    // For Claude.ai integrations, always respond with SSE format
-    // This ensures compatibility with their expected transport behavior
-    const sseData = `data: ${JSON.stringify(response)}\n\n`;
-    
-    return new Response(sseData, {
-      headers: {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-      }
-    });
-  } catch (error: any) {
-    const errorResponse = {
-      jsonrpc: "2.0",
-      id: null,
-      error: {
-        code: -32700,
-        message: `Parse error: ${error.message}`
-      }
-    };
-    
-    const sseData = `data: ${JSON.stringify(errorResponse)}\n\n`;
-    
-    return new Response(sseData, {
-      status: 400,
-      headers: {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-      }
-    });
-  }
-}
 
 // Main Worker with Streamable HTTP support
 export default {
@@ -773,76 +816,8 @@ export default {
       }
     }
 
-    // MCP endpoint with Streamable HTTP transport
-    if (pathname === '/mcp') {
-      if (request.method === 'GET') {
-        // Claude.ai integrations start with GET to establish SSE connection
-        console.log('=== MCP GET REQUEST (SSE CONNECTION) ===');
-        console.log('Headers:', Object.fromEntries(request.headers.entries()));
-        
-        if (!validateAuth(request)) {
-          console.log('GET request failed auth validation');
-          return new Response('Unauthorized', { 
-            status: 401,
-            headers: {
-              'WWW-Authenticate': 'Bearer',
-              'Access-Control-Allow-Origin': '*',
-            }
-          });
-        }
-
-        console.log('Establishing SSE connection for Claude.ai integration');
-        
-        // Create a persistent SSE connection that stays open
-        const stream = new ReadableStream({
-          start(controller) {
-            // Send a comment to establish the connection
-            controller.enqueue(new TextEncoder().encode(': SSE connection established\n\n'));
-            
-            // Keep the connection alive - Claude.ai will send MCP messages somehow
-            // TODO: Figure out how Claude.ai sends the actual MCP protocol messages
-          }
-        });
-
-        return new Response(stream, {
-          headers: {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-          }
-        });
-      } else if (request.method === 'POST') {
-        // Debug logging - temporarily log all requests
-        const body = await request.text();
-        console.log('=== MCP POST REQUEST ===');
-        console.log('Headers:', Object.fromEntries(request.headers.entries()));
-        console.log('Body:', body);
-        
-        // Recreate request for processing
-        const newRequest = new Request(request.url, {
-          method: request.method,
-          headers: request.headers,
-          body: body
-        });
-        return handleStreamableHTTPRequest(newRequest);
-      } else {
-        // Log any other requests to /mcp
-        console.log(`=== MCP ${request.method} REQUEST (NOT SUPPORTED) ===`);
-        console.log('Headers:', Object.fromEntries(request.headers.entries()));
-        return new Response(`Method ${request.method} not allowed`, { 
-          status: 405,
-          headers: {
-            'Allow': 'GET, POST',
-            'Access-Control-Allow-Origin': '*',
-          }
-        });
-      }
-    }
-
-    // Legacy SSE endpoint for backward compatibility (keep for mcp-remote)
-    if (pathname.startsWith('/sse')) {
+    // MCP endpoint with Streamable HTTP transport (for future use)
+    if (pathname === '/mcp' && request.method === 'POST') {
       if (!validateAuth(request)) {
         return new Response('Unauthorized', { 
           status: 401,
@@ -853,14 +828,123 @@ export default {
         });
       }
 
-      if (request.method === 'GET') {
-        // Debug logging for SSE GET requests
-        console.log('=== SSE GET REQUEST ===');
-        console.log('Headers:', Object.fromEntries(request.headers.entries()));
-        console.log('URL:', request.url);
+      console.log('=== MCP STREAMABLE HTTP REQUEST ===');
+      const body = await request.text();
+      console.log('Headers:', Object.fromEntries(request.headers.entries()));
+      console.log('Body:', body);
+      
+      try {
+        const message = JSON.parse(body);
+        const response = await diceServer.handleMessage(message);
         
+        return new Response(JSON.stringify(response), {
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+          }
+        });
+      } catch (error: any) {
+        return new Response(JSON.stringify({
+          jsonrpc: "2.0",
+          id: null,
+          error: {
+            code: -32700,
+            message: `Parse error: ${error.message}`
+          }
+        }), {
+          status: 400,
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+          }
+        });
+      }
+    }
+
+    // Legacy SSE endpoint - now uses Durable Objects for persistent connections
+    if (pathname.startsWith('/sse')) {
+      // Handle main /sse endpoint
+      if (pathname === '/sse') {
+        if (request.method === 'GET') {
+          // Use Durable Object for persistent SSE connection (Claude.ai integrations)
+          console.log('=== SSE GET REQUEST - USING DURABLE OBJECT ===');
+          console.log('Headers:', Object.fromEntries(request.headers.entries()));
+          
+          if (!validateAuth(request)) {
+            console.log('SSE GET request failed auth validation');
+            return new Response('Unauthorized', { 
+              status: 401,
+              headers: {
+                'WWW-Authenticate': 'Bearer',
+                'Access-Control-Allow-Origin': '*',
+              }
+            });
+          }
+
+          // Create Durable Object instance for this connection
+          const id = env.DICE_MCP_CONNECTIONS.idFromName('connection');
+          const durableObject = env.DICE_MCP_CONNECTIONS.get(id);
+          
+          // Forward request to Durable Object
+          const durableObjectUrl = new URL(request.url);
+          durableObjectUrl.pathname = '/connect';
+          
+          return durableObject.fetch(new Request(durableObjectUrl.toString(), {
+            method: 'GET',
+            headers: request.headers
+          }));
+        } else if (request.method === 'POST') {
+          // Handle direct MCP messages (for mcp-remote compatibility)
+          if (!validateAuth(request)) {
+            return new Response('Unauthorized', { 
+              status: 401,
+              headers: {
+                'WWW-Authenticate': 'Bearer',
+                'Access-Control-Allow-Origin': '*',
+              }
+            });
+          }
+
+          console.log('=== SSE POST REQUEST - DIRECT PROCESSING ===');
+          const diceServer = new DiceServer();
+          
+          try {
+            const message = await request.json();
+            const response = await diceServer.handleMessage(message);
+            
+            return new Response(JSON.stringify(response), {
+              headers: {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+              }
+            });
+          } catch (error: any) {
+            const errorResponse = {
+              jsonrpc: "2.0",
+              id: null,
+              error: {
+                code: -32700,
+                message: `Parse error: ${error.message}`
+              }
+            };
+            
+            return new Response(JSON.stringify(errorResponse), {
+              status: 400,
+              headers: {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+              }
+            });
+          }
+        }
+      }
+
+      // Handle /sse/messages endpoint (if Claude.ai uses this)
+      if (pathname === '/sse/messages' && request.method === 'POST') {
         if (!validateAuth(request)) {
-          console.log('SSE GET request failed auth validation');
           return new Response('Unauthorized', { 
             status: 401,
             headers: {
@@ -870,56 +954,21 @@ export default {
           });
         }
 
-        console.log('SSE GET request passed auth, sending SSE connection');
+        console.log('=== SSE MESSAGES POST REQUEST - USING DURABLE OBJECT ===');
         
-        // Initial SSE connection - send a proper SSE response
-        const sseData = [
-          'data: {"type":"connection","status":"connected"}\n\n',
-          'data: {"type":"server_info","name":"Dice Rolling Server","version":"2.0.0"}\n\n'
-        ].join('');
-
-        return new Response(sseData, {
-          status: 200,
-          headers: {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-          }
-        });
-      } else if (request.method === 'POST') {
-        // Handle MCP messages via SSE
-        try {
-          const message = await request.json();
-          const response = await diceServer.handleMessage(message);
-          
-          return new Response(JSON.stringify(response), {
-            headers: {
-              'Content-Type': 'application/json',
-              'Access-Control-Allow-Origin': '*',
-              'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-            }
-          });
-        } catch (error: any) {
-          const errorResponse = {
-            jsonrpc: "2.0",
-            id: null,
-            error: {
-              code: -32700,
-              message: `Parse error: ${error.message}`
-            }
-          };
-          
-          return new Response(JSON.stringify(errorResponse), {
-            status: 400,
-            headers: {
-              'Content-Type': 'application/json',
-              'Access-Control-Allow-Origin': '*',
-              'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-            }
-          });
-        }
+        // Use Durable Object for message processing
+        const id = env.DICE_MCP_CONNECTIONS.idFromName('connection');
+        const durableObject = env.DICE_MCP_CONNECTIONS.get(id);
+        
+        // Forward request to Durable Object
+        const durableObjectUrl = new URL(request.url);
+        durableObjectUrl.pathname = '/message';
+        
+        return durableObject.fetch(new Request(durableObjectUrl.toString(), {
+          method: 'POST',
+          headers: request.headers,
+          body: request.body
+        }));
       }
     }
 
