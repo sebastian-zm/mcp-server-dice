@@ -343,7 +343,251 @@ class DiceMCPServer {
     this.env = env;
   }
 
-  async handleMCPRequest(request: Request): Promise<Response> {
+  async handleSSERequest(request: Request): Promise<Response> {
+    console.log('🌊 Setting up SSE connection for MCP');
+    
+    // Create a readable stream for SSE
+    const { readable, writable } = new TransformStream();
+    const writer = writable.getWriter();
+
+    // Handle SSE connection
+    const handleSSE = async () => {
+      try {
+        // Send initial connection message
+        await writer.write(new TextEncoder().encode('event: message\n'));
+        await writer.write(new TextEncoder().encode('data: {"jsonrpc": "2.0", "method": "initialized", "params": {}}\n\n'));
+
+        // Handle incoming messages if this is a POST request with a body
+        if (request.method === 'POST') {
+          try {
+            const body = await request.text();
+            console.log('📨 SSE Request body:', body);
+            
+            // Parse and handle MCP message
+            const lines = body.split('\n');
+            for (const line of lines) {
+              if (line.startsWith('data: ') && line.length > 6) {
+                const data = line.substring(6);
+                try {
+                  const message = JSON.parse(data);
+                  const response = await this.handleMCPMessage(message);
+                  
+                  // Send response via SSE
+                  await writer.write(new TextEncoder().encode('event: message\n'));
+                  await writer.write(new TextEncoder().encode(`data: ${JSON.stringify(response)}\n\n`));
+                } catch (parseError) {
+                  console.error('Failed to parse SSE message:', parseError);
+                }
+              }
+            }
+          } catch (bodyError) {
+            console.error('Failed to read SSE request body:', bodyError);
+          }
+        }
+
+      } catch (error) {
+        console.error('SSE error:', error);
+      } finally {
+        await writer.close();
+      }
+    };
+
+    // Start handling SSE in the background
+    handleSSE().catch(console.error);
+
+    return new Response(readable, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': 'Content-Type, Cache-Control',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
+      }
+    });
+  }
+
+  async handleMCPMessage(message: any): Promise<any> {
+    try {
+      console.log('📨 MCP Message:', JSON.stringify(message, null, 2));
+
+      // Handle different MCP request types
+      switch (message.method) {
+        case 'tools/list':
+          return {
+            jsonrpc: "2.0",
+            result: {
+              tools: [
+                {
+                  name: "roll",
+                  description: "Roll dice using advanced notation. Supports complex expressions, keep/drop, exploding dice, and more.",
+                  inputSchema: {
+                    type: "object",
+                    properties: {
+                      expression: {
+                        type: "string",
+                        description: `Dice expression to evaluate. Supports:
+• Basic: 2d6, d20, d%
+• Keep/Drop: 4d6k3 (keep highest 3), 5d8d2 (drop lowest 2)
+• Exploding: 3d6! (explode on max), 2d10e8 (explode on 8+)
+• Reroll: 4d6r1 (reroll 1s)
+• Fudge: 4dF (FATE dice)
+• Math: d20+5, 2d6+1d4-2
+• Multiplication: 3*(2d6+1), 2×(d4+d6)
+• Complex: (2d6+3)*2+1d4-3d8k2`
+                      },
+                      description: {
+                        type: "string",
+                        description: "Optional description of what this roll is for"
+                      }
+                    },
+                    required: ["expression"]
+                  }
+                },
+                {
+                  name: "rate_limit_status",
+                  description: "Check your current rate limit status and remaining rolls",
+                  inputSchema: {
+                    type: "object",
+                    properties: {}
+                  }
+                }
+              ]
+            },
+            id: message.id
+          };
+        
+        case 'tools/call':
+          const toolResult = await this.handleToolCall(message.params);
+          return {
+            jsonrpc: "2.0",
+            result: toolResult,
+            id: message.id
+          };
+        
+        case 'initialize':
+          return {
+            jsonrpc: "2.0",
+            result: {
+              protocolVersion: "2024-11-05",
+              capabilities: {
+                tools: {}
+              },
+              serverInfo: {
+                name: "Dice Rolling Server",
+                version: "2.0.0"
+              }
+            },
+            id: message.id
+          };
+
+        case 'initialized':
+          // Just acknowledge
+          return {
+            jsonrpc: "2.0",
+            result: {},
+            id: message.id
+          };
+        
+        default:
+          return {
+            jsonrpc: "2.0",
+            error: {
+              code: -32601,
+              message: `Method not found: ${message.method}`
+            },
+            id: message.id
+          };
+      }
+    } catch (error) {
+      console.error('❌ MCP message error:', error);
+      return {
+        jsonrpc: "2.0",
+        error: {
+          code: -32603,
+          message: 'Internal error',
+          data: error.message
+        },
+        id: message.id
+      };
+    }
+  }
+
+  async handleToolCall(params: any): Promise<any> {
+    try {
+      const { name, arguments: args } = params;
+
+      switch (name) {
+        case 'roll':
+          return await this.executeRollTool(args);
+        
+        case 'rate_limit_status':
+          return await this.executeRateLimitStatus();
+        
+        default:
+          throw new Error(`Unknown tool: ${name}`);
+      }
+    } catch (error) {
+      console.error('❌ Tool call error:', error);
+      throw error;
+    }
+  }
+
+  private async executeRollTool(args: any): Promise<any> {
+    const { expression, description } = args;
+    console.log(`🎲 Rolling: ${expression}`);
+
+    try {
+      const result = this.parser.parse(expression);
+
+      let output = `🎲 **${result.expression}**`;
+      if (description) {
+        output += ` *(${description})*`;
+      }
+      output += `\n\n${result.breakdown}\n\n**Result: ${result.total}**`;
+
+      // Add some flair for special results
+      if (Math.abs(result.total) >= 100) {
+        output += " 💥";
+      } else if (result.total === 1 && result.rolls.length === 1) {
+        output += " 💀";
+      } else if (result.rolls.some(r => r === 20) && expression.includes('d20')) {
+        output += " ⭐";
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: output
+          }
+        ]
+      };
+
+    } catch (error) {
+      console.error('❌ Dice roll error:', error);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `❌ **Invalid dice expression**: ${error.message}\n\n**Examples:**\n• Basic: \`2d6\`, \`d20\`, \`d%\`\n• Advanced: \`4d6k3\`, \`3d6!\`, \`2*(d4+d6)\`\n• Complex: \`d20+5\`, \`(2d6+3)*2+1d4\``
+          }
+        ]
+      };
+    }
+  }
+
+  private async executeRateLimitStatus(): Promise<any> {
+    // Simplified rate limit status
+    return {
+      content: [
+        {
+          type: "text",
+          text: `🎲 **Rate Limit Status**\n\nAccess: Available\nLimits: 50 rolls/minute, 2,000 rolls/hour, 10,000 rolls/day\n\n✅ Service operational`
+        }
+      ]
+    };
+  }
     try {
       const body = await request.json();
       console.log('📨 MCP Request:', JSON.stringify(body, null, 2));
@@ -383,149 +627,7 @@ class DiceMCPServer {
     }
   }
 
-  private handleListTools(): Response {
-    const tools = [
-      {
-        name: "roll",
-        description: "Roll dice using advanced notation. Supports complex expressions, keep/drop, exploding dice, and more.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            expression: {
-              type: "string",
-              description: `Dice expression to evaluate. Supports:
-• Basic: 2d6, d20, d%
-• Keep/Drop: 4d6k3 (keep highest 3), 5d8d2 (drop lowest 2)
-• Exploding: 3d6! (explode on max), 2d10e8 (explode on 8+)
-• Reroll: 4d6r1 (reroll 1s)
-• Fudge: 4dF (FATE dice)
-• Math: d20+5, 2d6+1d4-2
-• Multiplication: 3*(2d6+1), 2×(d4+d6)
-• Complex: (2d6+3)*2+1d4-3d8k2`
-            },
-            description: {
-              type: "string",
-              description: "Optional description of what this roll is for"
-            }
-          },
-          required: ["expression"]
-        }
-      },
-      {
-        name: "rate_limit_status",
-        description: "Check your current rate limit status and remaining rolls",
-        inputSchema: {
-          type: "object",
-          properties: {}
-        }
-      }
-    ];
 
-    return new Response(JSON.stringify({
-      tools
-    }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  }
-
-  private async handleCallTool(params: any): Promise<Response> {
-    try {
-      const { name, arguments: args } = params;
-
-      switch (name) {
-        case 'roll':
-          return this.handleRollTool(args);
-        
-        case 'rate_limit_status':
-          return this.handleRateLimitStatus();
-        
-        default:
-          return new Response(JSON.stringify({
-            error: {
-              code: -32602,
-              message: `Unknown tool: ${name}`
-            }
-          }), {
-            status: 400,
-            headers: { 'Content-Type': 'application/json' }
-          });
-      }
-    } catch (error) {
-      console.error('❌ Tool call error:', error);
-      return new Response(JSON.stringify({
-        error: {
-          code: -32603,
-          message: 'Tool execution failed',
-          data: error.message
-        }
-      }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-  }
-
-  private async handleRollTool(args: any): Promise<Response> {
-    const { expression, description } = args;
-    console.log(`🎲 Rolling: ${expression}`);
-
-    try {
-      const result = this.parser.parse(expression);
-
-      let output = `🎲 **${result.expression}**`;
-      if (description) {
-        output += ` *(${description})*`;
-      }
-      output += `\n\n${result.breakdown}\n\n**Result: ${result.total}**`;
-
-      // Add some flair for special results
-      if (Math.abs(result.total) >= 100) {
-        output += " 💥";
-      } else if (result.total === 1 && result.rolls.length === 1) {
-        output += " 💀";
-      } else if (result.rolls.some(r => r === 20) && expression.includes('d20')) {
-        output += " ⭐";
-      }
-
-      return new Response(JSON.stringify({
-        content: [
-          {
-            type: "text",
-            text: output
-          }
-        ]
-      }), {
-        headers: { 'Content-Type': 'application/json' }
-      });
-
-    } catch (error) {
-      console.error('❌ Dice roll error:', error);
-      return new Response(JSON.stringify({
-        content: [
-          {
-            type: "text",
-            text: `❌ **Invalid dice expression**: ${error.message}\n\n**Examples:**\n• Basic: \`2d6\`, \`d20\`, \`d%\`\n• Advanced: \`4d6k3\`, \`3d6!\`, \`2*(d4+d6)\`\n• Complex: \`d20+5\`, \`(2d6+3)*2+1d4\``
-          }
-        ]
-      }), {
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-  }
-
-  private async handleRateLimitStatus(): Response {
-    // Simplified rate limit status
-    return new Response(JSON.stringify({
-      content: [
-        {
-          type: "text",
-          text: `🎲 **Rate Limit Status**\n\nAccess: Available\nLimits: 50 rolls/minute, 2,000 rolls/hour, 10,000 rolls/day\n\n✅ Service operational`
-        }
-      ]
-    }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  }
 
   private getClientIP(request: Request): string {
     const headers = request.headers;
@@ -595,7 +697,7 @@ export default {
           headers: {
             'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type, Authorization, Cf-Access-Jwt-Assertion',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization, Cf-Access-Jwt-Assertion, Cache-Control',
           }
         });
       }
@@ -609,12 +711,10 @@ export default {
         return diceServer.handleMCPRequest(request);
       }
 
-      // SSE endpoint (simplified for now)
+      // SSE endpoint for MCP
       if (pathname.startsWith('/sse')) {
-        return new Response('SSE endpoint - use /mcp for JSON-RPC', {
-          status: 200,
-          headers: { 'Content-Type': 'text/plain' }
-        });
+        console.log(`🔧 Handling SSE endpoint: ${pathname}`);
+        return diceServer.handleSSERequest(request);
       }
 
       // Root endpoint with server info
