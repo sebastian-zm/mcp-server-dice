@@ -469,10 +469,17 @@ type DiceResult = {
 // Global dice server instance
 const diceServer = new DiceServer();
 
-// Main Worker with SSE support
+// Helper function to get base URL
+function getBaseUrl(request: Request): string {
+  const url = new URL(request.url);
+  return `${url.protocol}//${url.host}`;
+}
+
+// Main Worker with OAuth support for Claude.ai integrations
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const { pathname } = new URL(request.url);
+    const baseUrl = getBaseUrl(request);
 
     // Handle OPTIONS requests for CORS
     if (request.method === 'OPTIONS') {
@@ -483,6 +490,96 @@ export default {
           'Access-Control-Allow-Headers': 'Content-Type, Authorization, Cache-Control',
         }
       });
+    }
+
+    // OAuth Discovery endpoint for Claude.ai integrations
+    if (pathname === '/.well-known/oauth-authorization-server') {
+      const oauthConfig = {
+        issuer: baseUrl,
+        authorization_endpoint: `${baseUrl}/oauth/authorize`,
+        token_endpoint: `${baseUrl}/oauth/token`,
+        registration_endpoint: `${baseUrl}/register`,
+        grant_types_supported: ["client_credentials"],
+        token_endpoint_auth_methods_supported: ["none", "client_secret_basic"],
+        response_types_supported: ["token"],
+        scopes_supported: ["mcp"],
+        subjects_supported: ["public"]
+      };
+
+      return new Response(JSON.stringify(oauthConfig), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+        }
+      });
+    }
+
+    // Dynamic Client Registration endpoint
+    if (pathname === '/register' && request.method === 'POST') {
+      try {
+        const registration = await request.json();
+        
+        // Generate a dummy client ID (since we don't require real auth)
+        const clientId = `client_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+        
+        const clientInfo = {
+          client_id: clientId,
+          client_id_issued_at: Math.floor(Date.now() / 1000),
+          grant_types: ["client_credentials"],
+          token_endpoint_auth_method: "none",
+          scope: "mcp"
+        };
+
+        return new Response(JSON.stringify(clientInfo), {
+          status: 201,
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+          }
+        });
+      } catch (error) {
+        return new Response(JSON.stringify({
+          error: "invalid_request",
+          error_description: "Invalid registration request"
+        }), {
+          status: 400,
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+          }
+        });
+      }
+    }
+
+    // OAuth Token endpoint (for client_credentials flow)
+    if (pathname === '/oauth/token' && request.method === 'POST') {
+      try {
+        // Since we don't require real authentication, just return a dummy token
+        const token = {
+          access_token: `token_${Date.now()}_${Math.random().toString(36).substring(7)}`,
+          token_type: "Bearer",
+          expires_in: 3600,
+          scope: "mcp"
+        };
+
+        return new Response(JSON.stringify(token), {
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+          }
+        });
+      } catch (error) {
+        return new Response(JSON.stringify({
+          error: "invalid_request",
+          error_description: "Invalid token request"
+        }), {
+          status: 400,
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+          }
+        });
+      }
     }
 
     // Handle SSE endpoint
@@ -570,8 +667,17 @@ export default {
         version: "2.0.0",
         description: "A stateless Model Context Protocol server for rolling dice with advanced notation.",
         endpoints: {
-          sse: new URL('/sse', request.url).href,
-          mcp: new URL('/mcp', request.url).href
+          sse: `${baseUrl}/sse`,
+          mcp: `${baseUrl}/mcp`,
+          oauth_discovery: `${baseUrl}/.well-known/oauth-authorization-server`,
+          register: `${baseUrl}/register`,
+          token: `${baseUrl}/oauth/token`
+        },
+        authentication: {
+          type: "oauth2",
+          flow: "client_credentials",
+          required: false,
+          description: "Public server with dummy OAuth for Claude.ai integration compatibility"
         },
         tools: [
           {
