@@ -67,8 +67,12 @@ export default {
 
     // SSE MCP endpoint using SQLite Durable Object
     if (pathname.startsWith('/sse')) {
+      console.log(`[SSE] Request received: ${request.method} ${pathname}`);
+      console.log(`[SSE] Query params:`, Object.fromEntries(url.searchParams));
+      
       // Check if SQLite DO is configured
       if (!env.SQLITE_DO || !env.DB) {
+        console.error('[SSE] SQLite DO not configured. env.SQLITE_DO:', !!env.SQLITE_DO, 'env.DB:', !!env.DB);
         return new Response(JSON.stringify({
           error: "SQLite Durable Object not configured. Please set up D1 database."
         }), {
@@ -82,15 +86,18 @@ export default {
       
       // Get or create a unique session ID
       const sessionId = url.searchParams.get('sessionId') || crypto.randomUUID();
+      console.log(`[SSE] Session ID: ${sessionId}`);
       
       // Get the Durable Object instance
       const id = env.SQLITE_DO.idFromName(sessionId);
       const durableObject = env.SQLITE_DO.get(id);
+      console.log(`[SSE] Got Durable Object instance for session: ${sessionId}`);
       
       // Route to the appropriate Durable Object endpoint
       const subPath = pathname.substring(4); // Remove '/sse' prefix
       const newUrl = new URL(request.url);
       newUrl.pathname = subPath || '/events';
+      console.log(`[SSE] Forwarding to DO path: ${newUrl.pathname}`);
       
       // Forward the request to the Durable Object
       return durableObject.fetch(newUrl, request);

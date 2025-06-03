@@ -1,5 +1,6 @@
 import { Env } from './types';
 import { McpDiceServer } from './mcp-server';
+import { getCorsHeaders } from './utils';
 
 export class SQLiteDurableObject {
   private state: DurableObjectState;
@@ -16,40 +17,56 @@ export class SQLiteDurableObject {
   private async initialize() {
     if (this.initialized) return;
     
-    // Create tables if they don't exist
-    await this.db.prepare(`
-      CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        message TEXT NOT NULL,
-        timestamp INTEGER NOT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-      )
-    `).run();
-
-    await this.db.prepare(`
-      CREATE INDEX IF NOT EXISTS idx_messages_timestamp 
-      ON messages(timestamp)
-    `).run();
-
-    await this.db.prepare(`
-      CREATE TABLE IF NOT EXISTS metadata (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      )
-    `).run();
-
-    // Initialize last event ID if not exists
-    const lastEventId = await this.db.prepare(
-      `SELECT value FROM metadata WHERE key = 'lastEventId'`
-    ).first();
+    console.log('[DO] Initializing SQLite Durable Object');
     
-    if (!lastEventId) {
-      await this.db.prepare(
-        `INSERT INTO metadata (key, value) VALUES ('lastEventId', '0')`
-      ).run();
-    }
+    try {
+      // Create tables if they don't exist
+      console.log('[DO] Creating messages table...');
+      await this.db.prepare(`
+        CREATE TABLE IF NOT EXISTS messages (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          message TEXT NOT NULL,
+          timestamp INTEGER NOT NULL,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+      `).run();
 
-    this.initialized = true;
+      console.log('[DO] Creating messages timestamp index...');
+      await this.db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_messages_timestamp 
+        ON messages(timestamp)
+      `).run();
+
+      console.log('[DO] Creating metadata table...');
+      await this.db.prepare(`
+        CREATE TABLE IF NOT EXISTS metadata (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        )
+      `).run();
+
+      // Initialize last event ID if not exists
+      console.log('[DO] Checking for existing lastEventId...');
+      const lastEventId = await this.db.prepare(
+        `SELECT value FROM metadata WHERE key = 'lastEventId'`
+      ).first();
+      
+      if (!lastEventId) {
+        console.log('[DO] Initializing lastEventId to 0');
+        await this.db.prepare(
+          `INSERT INTO metadata (key, value) VALUES ('lastEventId', '0')`
+        ).run();
+      } else {
+        console.log(`[DO] Found existing lastEventId: ${lastEventId.value}`);
+      }
+
+      this.initialized = true;
+      console.log('[DO] Initialization complete');
+      
+    } catch (error) {
+      console.error('[DO] Initialization error:', error);
+      throw error;
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -57,14 +74,30 @@ export class SQLiteDurableObject {
     
     const url = new URL(request.url);
     const pathname = url.pathname;
+    console.log(`[DO] Handling request: ${request.method} ${pathname}`);
+    console.log(`[DO] Headers:`, Object.fromEntries(request.headers));
+
+    // Handle CORS preflight
+    if (request.method === 'OPTIONS') {
+      console.log('[DO] Handling OPTIONS preflight request');
+      return new Response(null, {
+        status: 200,
+        headers: getCorsHeaders()
+      });
+    }
 
     if (pathname === '/send' && request.method === 'POST') {
+      console.log('[DO] Processing /send request');
       try {
         const message = await request.json();
+        console.log('[DO] Received message:', JSON.stringify(message, null, 2));
+        
         const response = await this.mcpServer.handleRequest(message);
+        console.log('[DO] MCP response:', response ? 'Message generated' : 'No response (notification)');
         
         if (response !== null) {
           // Get and increment last event ID
+          console.log('[DO] Incrementing event ID...');
           const result = await this.db.prepare(
             `UPDATE metadata SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) 
              WHERE key = 'lastEventId' 
@@ -72,15 +105,19 @@ export class SQLiteDurableObject {
           ).first();
           
           const eventId = result?.value || '1';
+          console.log(`[DO] New event ID: ${eventId}`);
           
           // Store the message
+          console.log('[DO] Storing message in database...');
           await this.db.prepare(
             `INSERT INTO messages (id, message, timestamp) VALUES (?, ?, ?)`
           ).bind(eventId, JSON.stringify(response), Date.now()).run();
+          console.log('[DO] Message stored successfully');
           
           // Clean up old messages (keep last 100 or last 5 minutes)
           const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
-          await this.db.prepare(`
+          console.log('[DO] Cleaning up old messages...');
+          const cleanupResult = await this.db.prepare(`
             DELETE FROM messages 
             WHERE timestamp < ? 
             AND id NOT IN (
@@ -89,26 +126,36 @@ export class SQLiteDurableObject {
               LIMIT 100
             )
           `).bind(fiveMinutesAgo).run();
+          console.log(`[DO] Cleaned up ${cleanupResult.meta.changes} old messages`);
         }
         
         return new Response(JSON.stringify({ success: true }), {
-          headers: { 'Content-Type': 'application/json' }
+          headers: { 
+            'Content-Type': 'application/json',
+            ...getCorsHeaders()
+          }
         });
         
       } catch (error: any) {
+        console.error('[DO] Error processing /send:', error);
         return new Response(JSON.stringify({
           error: error.message
         }), {
           status: 400,
-          headers: { 'Content-Type': 'application/json' }
+          headers: { 
+            'Content-Type': 'application/json',
+            ...getCorsHeaders()
+          }
         });
       }
     }
 
     if (pathname === '/events' && request.method === 'GET') {
       const lastEventId = url.searchParams.get('lastEventId') || '0';
+      console.log(`[DO] Processing /events request, lastEventId: ${lastEventId}`);
       
       // Get new messages since lastEventId
+      console.log('[DO] Querying for new messages...');
       const messages = await this.db.prepare(`
         SELECT id, message, timestamp 
         FROM messages 
@@ -117,46 +164,63 @@ export class SQLiteDurableObject {
         LIMIT 50
       `).bind(lastEventId).all();
       
+      console.log(`[DO] Found ${messages.results?.length || 0} new messages`);
+      
       if (!messages.results || messages.results.length === 0) {
         // Get current last event ID for client
         const currentLastId = await this.db.prepare(
           `SELECT value FROM metadata WHERE key = 'lastEventId'`
         ).first();
         
+        console.log(`[DO] No new messages, returning 204. Current lastEventId: ${currentLastId?.value || '0'}`);
+        
         return new Response('', {
           status: 204,
           headers: {
             'X-Last-Event-ID': currentLastId?.value || '0',
-            'Cache-Control': 'no-cache'
+            'Cache-Control': 'no-cache',
+            ...getCorsHeaders()
           }
         });
       }
       
       // Format messages as SSE
-      const sseData = messages.results.map(event => 
-        `id: ${event.id}\ndata: ${event.message}\n\n`
-      ).join('');
+      console.log('[DO] Formatting messages as SSE...');
+      const sseData = messages.results.map(event => {
+        console.log(`[DO] Formatting event ${event.id}`);
+        return `id: ${event.id}\ndata: ${event.message}\n\n`;
+      }).join('');
       
       const lastId = messages.results[messages.results.length - 1].id;
+      console.log(`[DO] Returning ${messages.results.length} events, lastId: ${lastId}`);
       
       return new Response(sseData, {
         headers: {
           'Content-Type': 'text/event-stream',
           'Cache-Control': 'no-cache',
-          'X-Last-Event-ID': String(lastId)
+          'X-Last-Event-ID': String(lastId),
+          ...getCorsHeaders()
         }
       });
     }
 
     if (pathname === '/clear' && request.method === 'POST') {
+      console.log('[DO] Processing /clear request');
+      
       // Clear all messages
-      await this.db.prepare(`DELETE FROM messages`).run();
+      const deleteResult = await this.db.prepare(`DELETE FROM messages`).run();
+      console.log(`[DO] Deleted ${deleteResult.meta.changes} messages`);
+      
       await this.db.prepare(
         `UPDATE metadata SET value = '0' WHERE key = 'lastEventId'`
       ).run();
+      console.log('[DO] Reset lastEventId to 0');
       
       return new Response(JSON.stringify({ success: true }), {
-        headers: { 'Content-Type': 'application/json' }
+        headers: { 
+          'Content-Type': 'application/json',
+          ...getCorsHeaders()
+        }
       });
     }
 
@@ -179,10 +243,14 @@ export class SQLiteDurableObject {
         oldestMessage: oldest?.oldest || null,
         newestMessage: newest?.newest || null
       }), {
-        headers: { 'Content-Type': 'application/json' }
+        headers: { 
+          'Content-Type': 'application/json',
+          ...getCorsHeaders()
+        }
       });
     }
 
+    console.log(`[DO] Unknown endpoint: ${pathname}`);
     return new Response('Not Found', { status: 404 });
   }
 }
