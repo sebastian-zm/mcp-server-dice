@@ -1,9 +1,11 @@
+import { McpAgent } from "agents/mcp";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 interface Env {
-  DICE_KV: KVNamespace;
-  ACCESS_AUD?: string;
-  ACCESS_TEAM_DOMAIN?: string;
+  DICE_KV: KVNamespace; // For rate limiting
+  ACCESS_AUD?: string; // Cloudflare Access audience tag (optional)
+  ACCESS_TEAM_DOMAIN?: string; // Your Cloudflare Access team domain (optional)
 }
 
 interface AuthContext {
@@ -13,21 +15,6 @@ interface AuthContext {
   };
   isAuthenticated: boolean;
   rateLimitKey: string;
-}
-
-interface DiceModifiers {
-  keep?: number;
-  drop?: number;
-  explode?: boolean;
-  explodeOn?: number;
-  reroll?: number;
-}
-
-interface DiceResult {
-  total: number;
-  rolls: number[];
-  expression: string;
-  breakdown: string;
 }
 
 // Dice notation parser
@@ -48,7 +35,7 @@ class DiceParser {
         throw new Error(`Unexpected character at position ${this.position}: '${this.input[this.position]}'`);
       }
       return result;
-    } catch (error: any) {
+    } catch (error) {
       throw new Error(`Parse error: ${error.message}`);
     }
   }
@@ -328,105 +315,124 @@ class DiceParser {
   }
 }
 
-// Simple MCP server implementation
-class DiceMCPServer {
-  private parser = new DiceParser();
-  private env: Env;
+interface DiceModifiers {
+  keep?: number;
+  drop?: number;
+  explode?: boolean;
+  explodeOn?: number;
+  reroll?: number;
+}
 
-  constructor(env: Env) {
-    this.env = env;
-  }
+interface DiceResult {
+  total: number;
+  rolls: number[];
+  expression: string;
+  breakdown: string;
+}
 
-  // Fixed SSE implementation for MCP
-  async handleSSERequest(request: Request): Promise<Response> {
-    console.log('🌊 Setting up SSE connection for MCP');
-    
-    // Ensure this is a GET request for SSE establishment
-    if (request.method !== 'GET') {
-      return new Response('SSE endpoint only accepts GET requests', { status: 405 });
+// Cloudflare Access JWT verification
+async function verifyAccessJWT(jwt: string, aud: string, teamDomain: string): Promise<any> {
+  try {
+    // Fetch Cloudflare Access public keys
+    const certsResponse = await fetch(`https://${teamDomain}.cloudflareaccess.com/cdn-cgi/access/certs`);
+    if (!certsResponse.ok) {
+      throw new Error('Failed to fetch Access certificates');
     }
-
-    // Create SSE response with proper headers
-    const encoder = new TextEncoder();
+    const { keys } = await certsResponse.json();
     
-    // Create the SSE stream
-    const { readable, writable } = new TransformStream();
-    const writer = writable.getWriter();
-
-    // Send initial MCP messages
-    const sendSSEMessage = async (data: any) => {
-      const message = `data: ${JSON.stringify(data)}\n\n`;
-      try {
-        await writer.write(encoder.encode(message));
-      } catch (error) {
-        console.error('Failed to write SSE message:', error);
-      }
+    // Parse JWT
+    const parts = jwt.split('.');
+    if (parts.length !== 3) {
+      throw new Error('Invalid JWT format');
+    }
+    
+    const [headerB64, payloadB64, signatureB64] = parts;
+    
+    // Decode header to get key ID
+    const header = JSON.parse(atob(headerB64.replace(/-/g, '+').replace(/_/g, '/')));
+    const payload = JSON.parse(atob(payloadB64.replace(/-/g, '+').replace(/_/g, '/')));
+    
+    // Check expiration
+    const now = Math.floor(Date.now() / 1000);
+    if (payload.exp && payload.exp < now) {
+      throw new Error('JWT expired');
+    }
+    
+    // Check not before
+    if (payload.nbf && payload.nbf > now) {
+      throw new Error('JWT not yet valid');
+    }
+    
+    // Verify audience
+    const audArray = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+    if (!audArray.includes(aud)) {
+      throw new Error('Invalid audience');
+    }
+    
+    // Find the key used to sign this JWT
+    const key = keys.find((k: any) => k.kid === header.kid);
+    if (!key) {
+      throw new Error('Key not found');
+    }
+    
+    // Import the public key
+    const publicKey = await crypto.subtle.importKey(
+      'jwk',
+      key,
+      {
+        name: 'RSASSA-PKCS1-v1_5',
+        hash: 'SHA-256',
+      },
+      false,
+      ['verify']
+    );
+    
+    // Prepare data for verification
+    const encoder = new TextEncoder();
+    const data = encoder.encode(`${headerB64}.${payloadB64}`);
+    const signature = Uint8Array.from(
+      atob(signatureB64.replace(/-/g, '+').replace(/_/g, '/')),
+      c => c.charCodeAt(0)
+    );
+    
+    // Verify signature
+    const valid = await crypto.subtle.verify(
+      'RSASSA-PKCS1-v1_5',
+      publicKey,
+      signature,
+      data
+    );
+    
+    if (!valid) {
+      throw new Error('Invalid signature');
+    }
+    
+    // Return user info
+    return {
+      sub: payload.sub,
+      email: payload.email,
+      name: payload.name,
     };
-
-    // Handle SSE connection initialization
-    const initializeSSE = async () => {
-      try {
-        // Send connection established event
-        await sendSSEMessage({
-          jsonrpc: "2.0",
-          method: "connection.established",
-          params: {}
-        });
-
-        console.log('✅ SSE connection established');
-        
-        // Keep the connection alive (MCP over SSE doesn't auto-close)
-        // The actual MCP messages will come via POST to /mcp
-        
-      } catch (error: any) {
-        console.error('❌ SSE initialization error:', error);
-        try {
-          await writer.close();
-        } catch (closeError) {
-          console.error('Error closing writer:', closeError);
-        }
-      }
-    };
-
-    // Initialize the SSE connection
-    initializeSSE().catch(console.error);
-
-    return new Response(readable, {
-      status: 200,
-      headers: {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache, no-store, must-revalidate',
-        'Connection': 'keep-alive',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type, Cache-Control, Authorization',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Expose-Headers': 'Content-Type',
-        // Important: Disable buffering for SSE
-        'X-Accel-Buffering': 'no',
-      }
-    });
+  } catch (error) {
+    console.error('JWT verification error:', error);
+    return null;
   }
+}
 
-  async handleMCPMessage(message: any, request?: Request): Promise<any> {
-    try {
-      console.log('📨 MCP Message:', JSON.stringify(message, null, 2));
+export class DiceMCP extends McpAgent<Env, unknown, AuthContext> {
+  server = new McpServer({
+    name: "Dice Rolling Server",
+    version: "2.0.0"
+  });
 
-      // Handle different MCP request types
-      switch (message.method) {
-        case 'tools/list':
-          return {
-            jsonrpc: "2.0",
-            result: {
-              tools: [
-                {
-                  name: "roll",
-                  description: "Roll dice using advanced notation. Supports complex expressions, keep/drop, exploding dice, and more.",
-                  inputSchema: {
-                    type: "object",
-                    properties: {
-                      expression: {
-                        type: "string",
-                        description: `Dice expression to evaluate. Supports:
+  private parser = new DiceParser();
+
+  async init() {
+    // Universal dice rolling tool
+    this.server.tool(
+      "roll",
+      {
+        expression: z.string().describe(`Dice expression to evaluate. Supports:
 • Basic: 2d6, d20, d%
 • Keep/Drop: 4d6k3 (keep highest 3), 5d8d2 (drop lowest 2)
 • Exploding: 3d6! (explode on max), 2d10e8 (explode on 8+)
@@ -434,509 +440,306 @@ class DiceMCPServer {
 • Fudge: 4dF (FATE dice)
 • Math: d20+5, 2d6+1d4-2
 • Multiplication: 3*(2d6+1), 2×(d4+d6)
-• Complex: (2d6+3)*2+1d4-3d8k2`
-                      },
-                      description: {
-                        type: "string",
-                        description: "Optional description of what this roll is for"
-                      }
-                    },
-                    required: ["expression"]
-                  }
-                },
-                {
-                  name: "rate_limit_status",
-                  description: "Check your current rate limit status and remaining rolls",
-                  inputSchema: {
-                    type: "object",
-                    properties: {}
-                  }
-                }
-              ]
-            },
-            id: message.id
-          };
-        
-        case 'tools/call':
-          const toolResult = await this.handleToolCall(message.params, request);
-          return {
-            jsonrpc: "2.0",
-            result: toolResult,
-            id: message.id
-          };
-        
-        case 'initialize':
-          return {
-            jsonrpc: "2.0",
-            result: {
-              protocolVersion: "2024-11-05",
-              capabilities: {
-                tools: {}
-              },
-              serverInfo: {
-                name: "Dice Rolling Server",
-                version: "2.0.0"
-              }
-            },
-            id: message.id
-          };
+• Complex: (2d6+3)*2+1d4-3d8k2`),
+        description: z.string().optional().describe("Optional description of what this roll is for")
+      },
+      async ({ expression, description }, context) => {
+        // Extract authentication context
+        const authContext = await this.getAuthContext(context.request);
+        const rateLimitKey = authContext.rateLimitKey;
+        const userTier = 'standard'; // Everyone gets same limits
 
-        case 'initialized':
-          // Just acknowledge
-          return {
-            jsonrpc: "2.0",
-            result: {},
-            id: message.id
-          };
-        
-        default:
-          return {
-            jsonrpc: "2.0",
-            error: {
-              code: -32601,
-              message: `Method not found: ${message.method}`
-            },
-            id: message.id
-          };
-      }
-    } catch (error: any) {
-      console.error('❌ MCP message error:', error);
-      return {
-        jsonrpc: "2.0",
-        error: {
-          code: -32603,
-          message: 'Internal error',
-          data: error.message
-        },
-        id: message.id
-      };
-    }
-  }
-
-  async handleToolCall(params: any, request?: Request): Promise<any> {
-    try {
-      const { name, arguments: args } = params;
-
-      switch (name) {
-        case 'roll':
-          return await this.executeRollTool(args, request);
-        
-        case 'rate_limit_status':
-          return await this.executeRateLimitStatus(request);
-        
-        default:
-          throw new Error(`Unknown tool: ${name}`);
-      }
-    } catch (error: any) {
-      console.error('❌ Tool call error:', error);
-      throw error;
-    }
-  }
-
-  private async executeRollTool(args: any, request?: Request): Promise<any> {
-    const { expression, description } = args;
-    console.log(`🎲 Rolling: ${expression}`);
-
-    try {
-      // Check rate limits first if we have request info
-      if (request) {
-        const clientIP = this.getClientIP(request);
-        const rateLimitKey = `ip:${clientIP}`;
-        const rateLimitCheck = await this.checkRateLimit(rateLimitKey);
-        
+        // Rate limiting check
+        const rateLimitCheck = await this.checkRateLimit(rateLimitKey, userTier);
         if (rateLimitCheck.limited) {
           return {
             content: [
               {
-                type: "text", 
-                text: `⚠️ **Rate limit exceeded**\n\n${rateLimitCheck.reason}\n\nTry again in ${rateLimitCheck.resetIn} seconds.\n\nUse the \`rate_limit_status\` tool to check your current usage.`
+                type: "text",
+                text: `⚠️ **Rate limit exceeded**\n\n${rateLimitCheck.reason}\n\nTry again in ${rateLimitCheck.resetIn} seconds.`
               }
-            ]
+            ],
           };
         }
-      }
 
-      const result = this.parser.parse(expression);
+        try {
+          const result = this.parser.parse(expression);
 
-      let output = `🎲 **${result.expression}**`;
-      if (description) {
-        output += ` *(${description})*`;
-      }
-      output += `\n\n${result.breakdown}\n\n**Result: ${result.total}**`;
-
-      // Add some flair for special results
-      if (Math.abs(result.total) >= 100) {
-        output += " 💥";
-      } else if (result.total === 1 && result.rolls.length === 1) {
-        output += " 💀";
-      } else if (result.rolls.some(r => r === 20) && expression.includes('d20')) {
-        output += " ⭐";
-      }
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: output
+          // Format the result
+          let output = `🎲 **${result.expression}**`;
+          if (description) {
+            output += ` *(${description})*`;
           }
-        ]
-      };
+          output += `\n\n${result.breakdown}\n\n**Result: ${result.total}**`;
 
-    } catch (error: any) {
-      console.error('❌ Dice roll error:', error);
-      return {
-        content: [
-          {
-            type: "text",
-            text: `❌ **Invalid dice expression**: ${error.message}\n\n**Examples:**\n• Basic: \`2d6\`, \`d20\`, \`d%\`\n• Advanced: \`4d6k3\`, \`3d6!\`, \`2*(d4+d6)\`\n• Complex: \`d20+5\`, \`(2d6+3)*2+1d4\``
+          // Add some flair for special results
+          if (Math.abs(result.total) >= 100) {
+            output += " 💥";
+          } else if (result.total === 1 && result.rolls.length === 1) {
+            output += " 💀";
+          } else if (result.rolls.some(r => r === 20) && expression.includes('d20')) {
+            output += " ⭐";
           }
-        ]
-      };
-    }
+
+          return {
+            content: [{ type: "text", text: output }],
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `❌ **Invalid dice expression**: ${error.message}\n\n**Examples:**\n• Basic: \`2d6\`, \`d20\`, \`d%\`\n• Advanced: \`4d6k3\`, \`3d6!\`, \`2*(d4+d6)\`\n• Complex: \`d20+5\`, \`(2d6+3)*2+1d4\``
+              }
+            ],
+          };
+        }
+      },
+      "Roll dice using advanced notation. Supports complex expressions, keep/drop, exploding dice, and more."
+    );
+
+    // Rate limit status tool for users
+    this.server.tool(
+      "rate_limit_status",
+      {},
+      async (params, context) => {
+        const authContext = await this.getAuthContext(context.request);
+        const rateLimitKey = authContext.rateLimitKey;
+        const userTier = 'standard'; // Everyone gets same limits
+
+        const now = Date.now();
+        const minuteKey = `rate_limit_minute:${rateLimitKey}:${Math.floor(now / 60000)}`;
+        const hourKey = `rate_limit_hour:${rateLimitKey}:${Math.floor(now / 3600000)}`;
+        const dayKey = `rate_limit_day:${rateLimitKey}:${Math.floor(now / 86400000)}`;
+
+        const limits = {
+          'standard': { minute: 50, hour: 2000, day: 10000 },
+        };
+
+        const userLimits = limits[userTier];
+
+        const [minuteCount, hourCount, dayCount] = await Promise.all([
+          this.context.env.DICE_KV.get(minuteKey).then(v => v ? parseInt(v) : 0),
+          this.context.env.DICE_KV.get(hourKey).then(v => v ? parseInt(v) : 0),
+          this.context.env.DICE_KV.get(dayKey).then(v => v ? parseInt(v) : 0)
+        ]);
+
+        let statusText = `🎲 **Rate Limit Status**\n`;
+        statusText += `Access: ${authContext.isAuthenticated ? 'Authenticated' : 'Anonymous (IP-based)'}\n`;
+        if (authContext.user?.email) {
+          statusText += `User: ${authContext.user.email}\n`;
+        }
+        statusText += `\n`;
+
+        statusText += `• **This minute**: ${minuteCount}/${userLimits.minute} rolls\n` +
+                     `• **This hour**: ${hourCount}/${userLimits.hour} rolls\n` +
+                     `• **Today**: ${dayCount}/${userLimits.day} rolls\n\n` +
+                     `**Remaining:**\n` +
+                     `• ${userLimits.minute - minuteCount} rolls this minute\n` +
+                     `• ${userLimits.hour - hourCount} rolls this hour\n` +
+                     `• ${userLimits.day - dayCount} rolls today`;
+
+        // Mention Cloudflare Access authentication if not authenticated
+        if (!authContext.isAuthenticated && this.context.env.ACCESS_TEAM_DOMAIN) {
+          statusText += `\n\n💡 Optional authentication available (useful for shared IPs/VPNs)`;
+        }
+
+        return {
+          content: [{ type: "text", text: statusText }],
+        };
+      },
+      "Check your current rate limit status and remaining rolls"
+    );
   }
 
-  private async executeRateLimitStatus(request?: Request): Promise<any> {
-    try {
-      // Get client identifier (IP-based for now)
-      const clientIP = request ? this.getClientIP(request) : 'unknown';
-      const rateLimitKey = `ip:${clientIP}`;
-      
-      const now = Date.now();
-      const minuteKey = `rate_limit_minute:${rateLimitKey}:${Math.floor(now / 60000)}`;
-      const hourKey = `rate_limit_hour:${rateLimitKey}:${Math.floor(now / 3600000)}`;
-      const dayKey = `rate_limit_day:${rateLimitKey}:${Math.floor(now / 86400000)}`;
+  private async getAuthContext(request: Request): Promise<AuthContext> {
+    // Check for Cloudflare Access JWT
+    const jwt = request.headers.get('Cf-Access-Jwt-Assertion');
+    
+    // if (jwt && this.context.env.ACCESS_AUD && this.context.env.ACCESS_TEAM_DOMAIN) {
+    //   const user = await verifyAccessJWT(jwt, this.context.env.ACCESS_AUD, this.context.env.ACCESS_TEAM_DOMAIN);
+    //   if (user) {
+    //     return {
+    //       user: { id: user.sub, email: user.email },
+    //       isAuthenticated: true,
+    //       rateLimitKey: `user:${user.sub}`
+    //     };
+    //   }
+    // }
 
-      // Rate limits
-      const limits = {
-        minute: 50,
-        hour: 2000,
-        day: 10000
-      };
-
-      // Get current usage from KV store
-      const [minuteCount, hourCount, dayCount] = await Promise.all([
-        this.env.DICE_KV.get(minuteKey).then(v => v ? parseInt(v) : 0),
-        this.env.DICE_KV.get(hourKey).then(v => v ? parseInt(v) : 0),
-        this.env.DICE_KV.get(dayKey).then(v => v ? parseInt(v) : 0)
-      ]);
-
-      // Calculate remaining limits
-      const remaining = {
-        minute: Math.max(0, limits.minute - minuteCount),
-        hour: Math.max(0, limits.hour - hourCount),
-        day: Math.max(0, limits.day - dayCount)
-      };
-
-      // Calculate reset times
-      const resetTimes = {
-        minute: 60 - (Math.floor(now / 1000) % 60),
-        hour: Math.ceil((3600000 - (now % 3600000)) / 1000),
-        day: Math.ceil((86400000 - (now % 86400000)) / 1000)
-      };
-
-      // Format reset times
-      const formatTime = (seconds: number): string => {
-        if (seconds < 60) return `${seconds}s`;
-        if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
-        const hours = Math.floor(seconds / 3600);
-        const minutes = Math.floor((seconds % 3600) / 60);
-        return `${hours}h ${minutes}m`;
-      };
-
-      // Create status message
-      let statusText = `🎲 **Rate Limit Status**\n\n`;
-      statusText += `**Client:** ${clientIP}\n`;
-      statusText += `**Access:** ${clientIP !== 'unknown' ? 'IP-based tracking' : 'Limited tracking'}\n\n`;
-      
-      statusText += `**Current Usage:**\n`;
-      statusText += `• **This minute**: ${minuteCount}/${limits.minute} rolls\n`;
-      statusText += `• **This hour**: ${hourCount}/${limits.hour} rolls\n`;
-      statusText += `• **Today**: ${dayCount}/${limits.day} rolls\n\n`;
-      
-      statusText += `**Remaining:**\n`;
-      statusText += `• **This minute**: ${remaining.minute} rolls (resets in ${formatTime(resetTimes.minute)})\n`;
-      statusText += `• **This hour**: ${remaining.hour} rolls (resets in ${formatTime(resetTimes.hour)})\n`;
-      statusText += `• **Today**: ${remaining.day} rolls (resets in ${formatTime(resetTimes.day)})\n\n`;
-
-      // Add status indicators
-      if (remaining.minute === 0) {
-        statusText += `⚠️ **Minute limit reached** - wait ${formatTime(resetTimes.minute)}\n`;
-      } else if (remaining.hour === 0) {
-        statusText += `⚠️ **Hourly limit reached** - wait ${formatTime(resetTimes.hour)}\n`;
-      } else if (remaining.day === 0) {
-        statusText += `⚠️ **Daily limit reached** - wait ${formatTime(resetTimes.day)}\n`;
-      } else {
-        statusText += `✅ **Service available** - you can make ${Math.min(remaining.minute, remaining.hour, remaining.day)} more rolls\n`;
-      }
-
-      // Add percentage usage bars
-      const getUsageBar = (used: number, total: number): string => {
-        const percentage = Math.round((used / total) * 100);
-        const filled = Math.round(percentage / 10);
-        const empty = 10 - filled;
-        return `[${'█'.repeat(filled)}${'░'.repeat(empty)}] ${percentage}%`;
-      };
-
-      statusText += `\n**Usage Visualization:**\n`;
-      statusText += `• Minute: ${getUsageBar(minuteCount, limits.minute)}\n`;
-      statusText += `• Hour: ${getUsageBar(hourCount, limits.hour)}\n`;
-      statusText += `• Day: ${getUsageBar(dayCount, limits.day)}`;
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: statusText
-          }
-        ]
-      };
-
-    } catch (error: any) {
-      console.error('❌ Rate limit status error:', error);
-      return {
-        content: [
-          {
-            type: "text",
-            text: `❌ **Rate Limit Status Error**\n\nFailed to retrieve rate limit information: ${error.message}\n\nDefault limits: 50/min, 2,000/hour, 10,000/day`
-          }
-        ]
-      };
-    }
-  }
-
-  async handleMCPRequest(request: Request): Promise<Response> {
-    try {
-      const body = await request.json();
-      console.log('📨 MCP Request:', JSON.stringify(body, null, 2));
-
-      const response = await this.handleMCPMessage(body, request);
-      
-      return new Response(JSON.stringify(response), {
-        headers: { 
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
-        }
-      });
-    } catch (error: any) {
-      console.error('❌ MCP request error:', error);
-      return new Response(JSON.stringify({
-        jsonrpc: "2.0",
-        error: {
-          code: -32603,
-          message: 'Internal error',
-          data: error.message
-        }
-      }), {
-        status: 500,
-        headers: { 
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*'
-        }
-      });
-    }
+    // Fall back to IP-based rate limiting
+    const clientIP = this.getClientIP(request);
+    return {
+      isAuthenticated: false,
+      rateLimitKey: `ip:${clientIP}`
+    };
   }
 
   private getClientIP(request: Request): string {
+    // Try different headers in order of preference
     const headers = request.headers;
+
+    // Cloudflare's connecting IP header (most reliable)
     const cfIP = headers.get('CF-Connecting-IP');
     if (cfIP) return cfIP;
 
+    // Fallback headers
     const xForwardedFor = headers.get('X-Forwarded-For');
     if (xForwardedFor) {
+      // Take the first IP if there are multiple
       return xForwardedFor.split(',')[0].trim();
     }
 
+    const xRealIP = headers.get('X-Real-IP');
+    if (xRealIP) return xRealIP;
+
+    // Last resort - this shouldn't happen in Cloudflare Workers
     return 'unknown';
   }
 
-  private async checkRateLimit(rateLimitKey: string, userTier: string = 'standard') {
+  private async checkRateLimit(rateLimitKey: string, userTier: string = 'standard'): Promise<{limited: boolean, reason?: string, resetIn?: number}> {
     const now = Date.now();
     const minuteKey = `rate_limit_minute:${rateLimitKey}:${Math.floor(now / 60000)}`;
+    const hourKey = `rate_limit_hour:${rateLimitKey}:${Math.floor(now / 3600000)}`;
+    const dayKey = `rate_limit_day:${rateLimitKey}:${Math.floor(now / 86400000)}`;
 
-    try {
-      const minuteCount = await this.env.DICE_KV.get(minuteKey);
-      const count = minuteCount ? parseInt(minuteCount) : 0;
+    const limits = {
+      'standard': { minute: 50, hour: 2000, day: 10000 },
+    };
 
-      if (count >= 50) { // 50 per minute limit
-        return {
-          limited: true,
-          reason: 'Too many rolls per minute (50/min limit)',
-          resetIn: 60 - (Math.floor(now / 1000) % 60)
-        };
-      }
+    const userLimits = limits[userTier];
 
-      // Update counter
-      await this.env.DICE_KV.put(minuteKey, (count + 1).toString(), { expirationTtl: 120 });
-      return { limited: false };
+    // Get current counts
+    const [minuteCount, hourCount, dayCount] = await Promise.all([
+      this.context.env.DICE_KV.get(minuteKey).then(v => v ? parseInt(v) : 0),
+      this.context.env.DICE_KV.get(hourKey).then(v => v ? parseInt(v) : 0),
+      this.context.env.DICE_KV.get(dayKey).then(v => v ? parseInt(v) : 0)
+    ]);
 
-    } catch (error: any) {
-      console.error('Rate limit check failed:', error);
-      return { limited: false }; // Allow on error
+    // Check limits
+    if (minuteCount >= userLimits.minute) {
+      return {
+        limited: true,
+        reason: `Too many rolls per minute (${userLimits.minute}/min limit)`,
+        resetIn: 60 - (Math.floor(now / 1000) % 60)
+      };
     }
+    if (hourCount >= userLimits.hour) {
+      return {
+        limited: true,
+        reason: `Too many rolls per hour (${userLimits.hour}/hour limit)`,
+        resetIn: 3600 - (Math.floor(now / 1000) % 3600)
+      };
+    }
+    if (dayCount >= userLimits.day) {
+      return {
+        limited: true,
+        reason: `Daily limit reached (${userLimits.day}/day limit)`,
+        resetIn: 86400 - (Math.floor(now / 1000) % 86400)
+      };
+    }
+
+    // Update counters
+    await Promise.all([
+      this.context.env.DICE_KV.put(minuteKey, (minuteCount + 1).toString(), { expirationTtl: 120 }),
+      this.context.env.DICE_KV.put(hourKey, (hourCount + 1).toString(), { expirationTtl: 7200 }),
+      this.context.env.DICE_KV.put(dayKey, (dayCount + 1).toString(), { expirationTtl: 172800 })
+    ]);
+
+    return { limited: false };
   }
 }
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    try {
-      console.log(`📨 Request: ${request.method} ${request.url}`);
-      
-      // Test KV access immediately
-      try {
-        await env.DICE_KV.get('test-startup');
-        console.log('✅ KV namespace accessible');
-      } catch (kvError: any) {
-        console.error('❌ KV namespace error:', kvError);
-        return new Response(JSON.stringify({
-          error: 'KV namespace not accessible',
-          details: kvError.message
-        }), {
-          status: 500,
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
+    const { pathname } = new URL(request.url);
 
-      const { pathname } = new URL(request.url);
-
-      // Handle OPTIONS requests for CORS
-      if (request.method === 'OPTIONS') {
-        return new Response(null, {
-          headers: {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type, Authorization, Cf-Access-Jwt-Assertion, Cache-Control',
-          }
-        });
-      }
-
-      // Create the dice server
-      const diceServer = new DiceMCPServer(env);
-
-      // SSE endpoint for MCP (GET only)
-      if (pathname === '/sse') {
-        console.log(`🔧 Handling SSE endpoint: ${pathname} (${request.method})`);
-        return diceServer.handleSSERequest(request);
-      }
-
-      // MCP endpoints (POST only)
-      if (pathname === '/mcp') {
-        console.log(`🔧 Handling MCP endpoint: ${pathname} (${request.method})`);
-        if (request.method !== 'POST') {
-          return new Response('MCP endpoint only accepts POST requests', { status: 405 });
-        }
-        return diceServer.handleMCPRequest(request);
-      }
-
-      // Root endpoint with server info
-      if (pathname === '/') {
-        const authInfo = env.ACCESS_TEAM_DOMAIN 
-          ? {
-              available: true,
-              provider: "Cloudflare Access",
-              note: "Optional - provides separate rate limit from IP"
-            }
-          : {
-              available: false,
-              note: "Set ACCESS_AUD and ACCESS_TEAM_DOMAIN env vars to enable"
-            };
-
-        return new Response(JSON.stringify({
-          name: "Dice Rolling Server",
-          version: "2.0.0",
-          description: "A Model Context Protocol server for rolling dice with advanced notation. Free to use with reasonable rate limits.",
-          status: "✅ Server running",
-          endpoints: {
-            mcp: request.url + "mcp",
-            sse: request.url + "sse"
-          },
-          transport: {
-            type: "SSE (Server-Sent Events)",
-            sse_endpoint: request.url + "sse",
-            mcp_endpoint: request.url + "mcp",
-            note: "Use SSE for establishing connection, POST to /mcp for requests"
-          },
-          authentication: authInfo,
-          rateLimits: {
-            all_users: "50 rolls/minute, 2,000 rolls/hour, 10,000 rolls/day",
-            note: "Same limits for everyone. Auth useful for shared IPs."
-          },
-          tools: [
-            {
-              name: "roll",
-              description: "Roll dice with advanced notation",
-              examples: [
-                "roll 2d6",
-                "roll 4d6k3", 
-                "roll d20+5",
-                "roll 2d10!",
-                "roll (2d6+3)*2"
-              ]
-            },
-            {
-              name: "rate_limit_status",
-              description: "Check your current rate limits"
-            }
-          ],
-          dice_notation: {
-            basic: "NdX (e.g., 2d6, d20, d%)",
-            keep_drop: "NdXkY (keep highest Y), NdXdY (drop lowest Y)",
-            exploding: "NdX! (explode on max), NdXeY (explode on Y+)",
-            reroll: "NdXrY (reroll if result is Y or less)",
-            fudge: "NdF (FATE dice: -1, 0, +1)",
-            math: "Supports +, -, *, parentheses",
-            limits: {
-              dice_count: "1-1,000",
-              dice_sides: "1-10,000",
-              numbers: "Up to 1,000,000"
-            }
-          }
-        }, null, 2), {
-          headers: {
-            'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type, Authorization, Cf-Access-Jwt-Assertion'
-          }
-        });
-      }
-
-      // Test endpoint for debugging
-      if (pathname === '/test') {
-        const parser = new DiceParser();
-        const testResult = parser.parse('2d6+3');
-        
-        return new Response(JSON.stringify({
-          message: 'Test successful',
-          diceResult: testResult,
-          env: Object.keys(env),
-          timestamp: new Date().toISOString()
-        }), {
-          headers: { 
-            'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*'
-          }
-        });
-      }
-
-      return new Response('Not found', { status: 404 });
-
-    } catch (error: any) {
-      console.error('💥 Main handler error:', error);
-      
-      return new Response(JSON.stringify({
-        error: 'Internal server error',
-        message: error.message,
-        stack: error.stack,
-        timestamp: new Date().toISOString()
-      }), {
-        status: 500,
+    // Handle OPTIONS requests for CORS
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
         headers: {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*'
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type, Authorization, Cf-Access-Jwt-Assertion',
         }
       });
     }
+
+    // MCP endpoints - handle both SSE and standard
+    if (pathname.startsWith('/sse') || pathname.startsWith('/mcp')) {
+      if (pathname.startsWith('/sse')) {
+        return DiceMCP.serveSSE('/sse').fetch(request, env, ctx);
+      } else {
+        return DiceMCP.serve('/mcp').fetch(request, env, ctx);
+      }
+    }
+
+    // Root endpoint with server info
+    if (pathname === '/') {
+      const authInfo = env.ACCESS_TEAM_DOMAIN 
+        ? {
+            available: true,
+            provider: "Cloudflare Access",
+            note: "Optional - provides separate rate limit from IP"
+          }
+        : {
+            available: false,
+            note: "Set ACCESS_AUD and ACCESS_TEAM_DOMAIN env vars to enable"
+          };
+
+      return new Response(JSON.stringify({
+        name: "Dice Rolling Server",
+        version: "2.0.0",
+        description: "A Model Context Protocol server for rolling dice with advanced notation. Free to use with reasonable rate limits.",
+        endpoints: {
+          sse: request.url + "sse",
+          mcp: request.url + "mcp"
+        },
+        authentication: authInfo,
+        rateLimits: {
+          all_users: "50 rolls/minute, 2,000 rolls/hour, 10,000 rolls/day",
+          note: "Same limits for everyone. Auth useful for shared IPs."
+        },
+        tools: [
+          {
+            name: "roll",
+            description: "Roll dice with advanced notation",
+            examples: [
+              "roll 2d6",
+              "roll 4d6k3",
+              "roll d20+5",
+              "roll 2d10!",
+              "roll (2d6+3)*2"
+            ]
+          },
+          {
+            name: "rate_limit_status",
+            description: "Check your current rate limits"
+          }
+        ],
+        dice_notation: {
+          basic: "NdX (e.g., 2d6, d20, d%)",
+          keep_drop: "NdXkY (keep highest Y), NdXdY (drop lowest Y)",
+          exploding: "NdX! (explode on max), NdXeY (explode on Y+)",
+          reroll: "NdXrY (reroll if result is Y or less)",
+          fudge: "NdF (FATE dice: -1, 0, +1)",
+          math: "Supports +, -, *, parentheses",
+          limits: {
+            dice_count: "1-1,000",
+            dice_sides: "1-10,000",
+            numbers: "Up to 1,000,000"
+          }
+        }
+      }, null, 2), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type, Authorization, Cf-Access-Jwt-Assertion'
+        }
+      });
+    }
+
+    return new Response('Not found', { status: 404 });
   },
 };
