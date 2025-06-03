@@ -75,6 +75,8 @@ class DiceServer {
   async handleMessage(message: any) {
     let response;
     
+    console.log('=== HANDLING MESSAGE ===', message);
+    
     switch (message.method) {
       case 'initialize':
         response = {
@@ -95,6 +97,11 @@ class DiceServer {
           }
         };
         break;
+        
+      case 'notifications/initialized':
+        // This is a notification, so no response needed
+        console.log('Received initialized notification');
+        return null;
         
       case 'tools/list':
         const tools = [];
@@ -158,6 +165,7 @@ class DiceServer {
         };
     }
 
+    console.log('=== SENDING RESPONSE ===', response);
     return response;
   }
 }
@@ -505,8 +513,20 @@ async function handleStreamableHTTPRequest(request: Request): Promise<Response> 
   }
 
   try {
-    const message = await request.json();
+    let message;
+    const body = await request.text();
+    try {
+      message = JSON.parse(body);
+    } catch (parseError) {
+      throw new Error(`Invalid JSON: ${parseError}`);
+    }
+    
     const response = await diceServer.handleMessage(message);
+    
+    // Handle notifications (no response needed)
+    if (response === null) {
+      return new Response('', { status: 204 });
+    }
     
     // For Claude.ai integrations, always respond with SSE format
     // This ensures compatibility with their expected transport behavior
@@ -746,7 +766,19 @@ export default {
 
     // MCP endpoint with Streamable HTTP transport
     if (pathname === '/mcp' && request.method === 'POST') {
-      return handleStreamableHTTPRequest(request);
+      // Debug logging - temporarily log all requests
+      const body = await request.text();
+      console.log('=== MCP REQUEST ===');
+      console.log('Headers:', Object.fromEntries(request.headers.entries()));
+      console.log('Body:', body);
+      
+      // Recreate request for processing
+      const newRequest = new Request(request.url, {
+        method: request.method,
+        headers: request.headers,
+        body: body
+      });
+      return handleStreamableHTTPRequest(newRequest);
     }
 
     // Legacy SSE endpoint for backward compatibility (keep for mcp-remote)
