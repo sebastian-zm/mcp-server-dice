@@ -1,1274 +1,154 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-
-// Type definitions
-type Env = {
-  DICE_KV?: KVNamespace; // Optional, not used without persistence
-  ACCESS_AUD?: string;
-  ACCESS_TEAM_DOMAIN?: string;
-  DICE_MCP_CONNECTIONS: DurableObjectNamespace; // Durable Object binding
-}
-
-// Simple stateless MCP server
-class DiceServer {
-  private parser: DiceParser;
-  private tools = new Map<string, { handler: Function; description: string; inputSchema: any }>();
-
-  constructor() {
-    this.parser = new DiceParser();
-    this.setupTools();
-  }
-
-  private setupTools() {
-    // Roll dice tool (no history saving)
-    const rollHandler = async ({ expression, description }: any) => {
-      try {
-        const result = this.parser.parse(expression);
-
-        let output = `🎲 **${result.expression}**`;
-        if (description) {
-          output += ` *(${description})*`;
-        }
-        output += `\n\n${result.breakdown}\n\n**Result: ${result.total}**`;
-
-        return {
-          content: [{ type: "text", text: output }],
-        };
-      } catch (error: any) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `❌ **Invalid dice expression**: ${error.message}\n\n**Examples:**\n• Basic: \`2d6\`, \`d20\`, \`d%\`\n• Advanced: \`4d6k3\`, \`3d6!\`, \`2*(d4+d6)\`\n• Complex: \`d20+5\`, \`(2d6+3)*2+1d4\``
-            }
-          ],
-        };
-      }
-    };
-
-    this.tools.set("roll", {
-      handler: rollHandler,
-      description: "Roll dice using advanced notation. Supports complex expressions, keep/drop, exploding dice, and more.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          expression: {
-            type: "string",
-            description: `Dice expression to evaluate. Supports:
-• Basic: 2d6, d20, d%
-• Keep/Drop: 4d6k3 (keep highest 3), 5d8d2 (drop lowest 2)
-• Exploding: 3d6! (explode on max), 2d10e8 (explode on 8+)
-• Reroll: 4d6r1 (reroll 1s)
-• Fudge: 4dF (FATE dice)
-• Math: d20+5, 2d6+1d4-2
-• Multiplication: 3*(2d6+1), 2×(d4+d6)
-• Complex: (2d6+3)*2+1d4-3d8k2`
-          },
-          description: {
-            type: "string",
-            description: "Optional description of what this roll is for"
-          }
-        },
-        required: ["expression"]
-      }
-    });
-  }
-
-  async handleMessage(message: any) {
-    let response;
-    
-    console.log('=== HANDLING MESSAGE ===', message);
-    
-    switch (message.method) {
-      case 'initialize':
-        response = {
-          jsonrpc: "2.0",
-          id: message.id,
-          result: {
-            protocolVersion: "2025-03-26",
-            capabilities: {
-              tools: {},
-              resources: {},
-              prompts: {},
-              logging: {}
-            },
-            serverInfo: {
-              name: "Dice Rolling Server",
-              version: "2.0.0"
-            }
-          }
-        };
-        break;
-        
-      case 'notifications/initialized':
-        // This is a notification, so no response needed
-        console.log('Received initialized notification');
-        return null;
-        
-      case 'tools/list':
-        const tools = [];
-        for (const [name, tool] of this.tools.entries()) {
-          tools.push({
-            name: name,
-            description: tool.description,
-            inputSchema: tool.inputSchema
-          });
-        }
-        response = {
-          jsonrpc: "2.0",
-          id: message.id,
-          result: { tools }
-        };
-        break;
-        
-      case 'prompts/list':
-        // Return empty prompts list (we don't have any prompts)
-        response = {
-          jsonrpc: "2.0",
-          id: message.id,
-          result: { prompts: [] }
-        };
-        break;
-        
-      case 'tools/call':
-        const toolName = message.params.name;
-        const args = message.params.arguments || {};
-        
-        if (this.tools.has(toolName)) {
-          const tool = this.tools.get(toolName)!;
-          try {
-            const result = await tool.handler(args);
-            response = {
-              jsonrpc: "2.0",
-              id: message.id,
-              result: result
-            };
-          } catch (error: any) {
-            response = {
-              jsonrpc: "2.0",
-              id: message.id,
-              error: {
-                code: -32603,
-                message: error.message
-              }
-            };
-          }
-        } else {
-          response = {
-            jsonrpc: "2.0",
-            id: message.id,
-            error: {
-              code: -32601,
-              message: `Tool not found: ${toolName}`
-            }
-          };
-        }
-        break;
-        
-      default:
-        response = {
-          jsonrpc: "2.0",
-          id: message.id,
-          error: {
-            code: -32601,
-            message: `Method not found: ${message.method}`
-          }
-        };
-    }
-
-    console.log('=== SENDING RESPONSE ===', response);
-    return response;
-  }
-}
-
-// Dice notation parser (same as before)
-class DiceParser {
-  private position = 0;
-  private input = "";
-  private readonly MAX_NUMBER = 1000000;
-  private readonly MAX_DICE_COUNT = 1000;
-  private readonly MAX_DICE_SIDES = 10000;
-
-  parse(expression: string): DiceResult {
-    this.input = expression.toLowerCase().replace(/\s+/g, '');
-    this.position = 0;
-
-    try {
-      const result = this.parseExpression();
-      if (this.position < this.input.length) {
-        throw new Error(`Unexpected character at position ${this.position}: '${this.input[this.position]}'`);
-      }
-      return result;
-    } catch (error: any) {
-      throw new Error(`Parse error: ${error.message}`);
-    }
-  }
-
-  private parseExpression(): DiceResult {
-    let left = this.parseTerm();
-
-    while (this.position < this.input.length) {
-      const operator = this.input[this.position];
-      if (operator === '+' || operator === '-') {
-        this.position++;
-        const right = this.parseTerm();
-        left = this.combineResults(left, right, operator);
-      } else {
-        break;
-      }
-    }
-
-    return left;
-  }
-
-  private parseTerm(): DiceResult {
-    let left = this.parseFactor();
-
-    while (this.position < this.input.length) {
-      const char = this.input[this.position];
-      if (char === '*' || char === '×' || char === '·') {
-        this.position++;
-        const right = this.parseFactor();
-        left = this.multiplyResults(left, right);
-      } else {
-        break;
-      }
-    }
-
-    return left;
-  }
-
-  private parseFactor(): DiceResult {
-    if (this.peek() === '(') {
-      this.position++; // consume '('
-      const result = this.parseExpression();
-      if (this.peek() !== ')') {
-        throw new Error("Missing closing parenthesis");
-      }
-      this.position++; // consume ')'
-      return result;
-    }
-
-    return this.parseDiceOrNumber();
-  }
-
-  private parseDiceOrNumber(): DiceResult {
-    const start = this.position;
-
-    // Handle negative numbers
-    let negative = false;
-    if (this.peek() === '-') {
-      negative = true;
-      this.position++;
-    }
-
-    // Parse number
-    let count = this.parseNumber();
-
-    // Check for dice notation
-    if (this.peek() === 'd') {
-      this.position++; // consume 'd'
-
-      // Handle percentile dice
-      if (this.peek() === '%') {
-        this.position++;
-        return this.rollDice(count || 1, 100, { negative });
-      }
-
-      // Handle fudge dice
-      if (this.peek() === 'f') {
-        this.position++;
-        return this.rollFudgeDice(count || 1, { negative });
-      }
-
-      // Parse sides
-      const sides = this.parseNumber();
-      if (!sides) {
-        throw new Error("Missing number of sides after 'd'");
-      }
-
-      // Parse modifiers (keep, drop, explode)
-      const modifiers = this.parseModifiers();
-
-      return this.rollDice(count || 1, sides, { ...modifiers, negative });
-    }
-
-    // Just a number
-    if (count === null) {
-      throw new Error(`Expected number or dice notation at position ${start}`);
-    }
-
-    return {
-      total: negative ? -count : count,
-      rolls: [],
-      expression: negative ? `-${count}` : count.toString(),
-      breakdown: negative ? `-${count}` : count.toString()
-    };
-  }
-
-  private parseModifiers(): DiceModifiers {
-    const modifiers: DiceModifiers = {};
-
-    while (this.position < this.input.length) {
-      const char = this.peek();
-
-      if (char === 'k') {
-        this.position++;
-        modifiers.keep = this.parseNumber();
-        if (!modifiers.keep) throw new Error("Missing number after 'k'");
-      } else if (char === 'd' && this.peek(1) !== undefined && /\d/.test(this.peek(1))) {
-        this.position++;
-        modifiers.drop = this.parseNumber();
-        if (!modifiers.drop) throw new Error("Missing number after 'd'");
-      } else if (char === '!' || char === 'e') {
-        this.position++;
-        modifiers.explode = true;
-        if (/\d/.test(this.peek())) {
-          modifiers.explodeOn = this.parseNumber();
-        }
-      } else if (char === 'r') {
-        this.position++;
-        modifiers.reroll = this.parseNumber();
-        if (!modifiers.reroll) throw new Error("Missing number after 'r'");
-      } else {
-        break;
-      }
-    }
-
-    return modifiers;
-  }
-
-  private parseNumber(): number | null {
-    const start = this.position;
-    while (this.position < this.input.length && /\d/.test(this.input[this.position])) {
-      this.position++;
-    }
-
-    if (start === this.position) return null;
-    const num = parseInt(this.input.slice(start, this.position));
-    
-    if (num > this.MAX_NUMBER) {
-      throw new Error(`Number too large (max ${this.MAX_NUMBER.toLocaleString()})`);
-    }
-    
-    return num;
-  }
-
-  private peek(offset = 0): string {
-    return this.input[this.position + offset] || '';
-  }
-
-  private rollDice(count: number, sides: number, options: DiceModifiers & { negative?: boolean } = {}): DiceResult {
-    if (count <= 0 || count > this.MAX_DICE_COUNT) {
-      throw new Error(`Dice count must be between 1 and ${this.MAX_DICE_COUNT}`);
-    }
-    if (sides <= 0 || sides > this.MAX_DICE_SIDES) {
-      throw new Error(`Dice sides must be between 1 and ${this.MAX_DICE_SIDES}`);
-    }
-    
-    if (count * sides > this.MAX_NUMBER) {
-      throw new Error("Total possible outcomes too large");
-    }
-
-    const rolls: number[] = [];
-    const allRolls: number[] = [];
-
-    for (let i = 0; i < count; i++) {
-      let roll = Math.floor(Math.random() * sides) + 1;
-      rolls.push(roll);
-      allRolls.push(roll);
-
-      if (options.explode) {
-        const explodeThreshold = options.explodeOn || sides;
-        let explodeCount = 0;
-        while (roll >= explodeThreshold && explodeCount < 100) {
-          roll = Math.floor(Math.random() * sides) + 1;
-          allRolls.push(roll);
-          rolls[i] += roll;
-          explodeCount++;
-        }
-      }
-
-      if (options.reroll && rolls[i] <= options.reroll) {
-        rolls[i] = Math.floor(Math.random() * sides) + 1;
-      }
-    }
-
-    let finalRolls = [...rolls];
-    if (options.keep) {
-      finalRolls.sort((a, b) => b - a);
-      finalRolls = finalRolls.slice(0, options.keep);
-    } else if (options.drop) {
-      finalRolls.sort((a, b) => a - b);
-      finalRolls = finalRolls.slice(options.drop);
-    }
-
-    const total = finalRolls.reduce((sum, roll) => sum + roll, 0) * (options.negative ? -1 : 1);
-
-    let expr = `${count}d${sides}`;
-    if (options.keep) expr += `k${options.keep}`;
-    if (options.drop) expr += `d${options.drop}`;
-    if (options.explode) expr += options.explodeOn ? `e${options.explodeOn}` : '!';
-    if (options.reroll) expr += `r${options.reroll}`;
-    if (options.negative) expr = `-${expr}`;
-
-    return {
-      total,
-      rolls: allRolls,
-      expression: expr,
-      breakdown: this.buildBreakdown(rolls, finalRolls, options)
-    };
-  }
-
-  private rollFudgeDice(count: number, options: { negative?: boolean } = {}): DiceResult {
-    if (count <= 0 || count > this.MAX_DICE_COUNT) {
-      throw new Error(`Dice count must be between 1 and ${this.MAX_DICE_COUNT}`);
-    }
-
-    const rolls: number[] = [];
-    for (let i = 0; i < count; i++) {
-      rolls.push(Math.floor(Math.random() * 3) - 1);
-    }
-
-    const total = rolls.reduce((sum, roll) => sum + roll, 0) * (options.negative ? -1 : 1);
-    const fudgeSymbols = rolls.map(r => r === -1 ? '[-]' : r === 0 ? '[ ]' : '[+]');
-
-    return {
-      total,
-      rolls,
-      expression: `${options.negative ? '-' : ''}${count}dF`,
-      breakdown: `${fudgeSymbols.join(' ')} = ${total}`
-    };
-  }
-
-  private buildBreakdown(originalRolls: number[], finalRolls: number[], options: DiceModifiers): string {
-    let breakdown = `[${originalRolls.join(', ')}]`;
-
-    if (options.keep || options.drop) {
-      breakdown += ` → [${finalRolls.join(', ')}]`;
-    }
-
-    breakdown += ` = ${finalRolls.reduce((sum, roll) => sum + roll, 0)}`;
-    return breakdown;
-  }
-
-  private combineResults(left: DiceResult, right: DiceResult, operator: string): DiceResult {
-    const total = operator === '+' ? left.total + right.total : left.total - right.total;
-
-    return {
-      total,
-      rolls: [...left.rolls, ...right.rolls],
-      expression: `${left.expression} ${operator} ${right.expression}`,
-      breakdown: `${left.breakdown} ${operator} ${right.breakdown} = ${total}`
-    };
-  }
-
-  private multiplyResults(left: DiceResult, right: DiceResult): DiceResult {
-    return {
-      total: left.total * right.total,
-      rolls: [...left.rolls, ...right.rolls],
-      expression: `${left.expression} × ${right.expression}`,
-      breakdown: `(${left.breakdown}) × (${right.breakdown}) = ${left.total * right.total}`
-    };
-  }
-}
-
-type DiceModifiers = {
-  keep?: number;
-  drop?: number;
-  explode?: boolean;
-  explodeOn?: number;
-  reroll?: number;
-}
-
-type DiceResult = {
-  total: number;
-  rolls: number[];
-  expression: string;
-  breakdown: string;
-}
-
-// Global dice server instance for non-Durable Object requests
-const diceServer = new DiceServer();
-
-// Durable Object for handling persistent MCP connections
-// Add this to your DiceMCPConnections class
-
-export class DiceMCPConnections {
-  private state: DurableObjectState;
-  private env: Env;
-  private diceServer: DiceServer;
-  private connections: Map<string, ReadableStreamDefaultController> = new Map();
-
-  constructor(state: DurableObjectState, env: Env) {
-    this.state = state;
-    this.env = env;
-    this.diceServer = new DiceServer();
-  }
-
-  async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    const pathname = url.pathname;
-
-    console.log(`=== DURABLE OBJECT REQUEST === ${request.method} ${pathname}`);
-
-    // Handle SSE connection establishment
-    if (pathname === '/connect' && request.method === 'GET') {
-      return this.handleSSEConnection(request);
-    }
-
-    // Handle MCP message processing via SSE
-    if (pathname === '/message' && request.method === 'POST') {
-      return this.handleMCPMessageViaSSE(request);
-    }
-
-    return new Response('Not found', { status: 404 });
-  }
-
-  private async handleSSEConnection(request: Request): Promise<Response> {
-    console.log('=== ESTABLISHING SSE CONNECTION ===');
-    
-    const connectionId = `conn_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-    
-    // Create SSE stream
-    const stream = new ReadableStream({
-      start: (controller) => {
-        // Store controller for sending responses
-        this.connections.set(connectionId, controller);
-        
-        // Send initial connection message
-        const encoder = new TextEncoder();
-        controller.enqueue(encoder.encode(': MCP SSE connection established\n\n'));
-        
-        // Optional: Send connection ID to client
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-          jsonrpc: "2.0",
-          method: "notifications/connection_established",
-          params: { connectionId }
-        })}\n\n`));
-      },
-      cancel: () => {
-        console.log(`Connection ${connectionId} cancelled`);
-        this.connections.delete(connectionId);
-      }
-    });
-
-    // Set up heartbeat for this connection
-    const heartbeatInterval = setInterval(() => {
-      const controller = this.connections.get(connectionId);
-      if (controller) {
-        try {
-          const encoder = new TextEncoder();
-          controller.enqueue(encoder.encode(': heartbeat\n\n'));
-        } catch (error) {
-          console.log(`Connection ${connectionId} closed, clearing heartbeat`);
-          clearInterval(heartbeatInterval);
-          this.connections.delete(connectionId);
-        }
-      } else {
-        clearInterval(heartbeatInterval);
-      }
-    }, 30000);
-
-    // Handle client disconnect
-    request.signal?.addEventListener('abort', () => {
-      console.log(`Client disconnected: ${connectionId}`);
-      clearInterval(heartbeatInterval);
-      this.connections.delete(connectionId);
-    });
-
-    return new Response(stream, {
-      headers: {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-        'X-Connection-Id': connectionId, // Send connection ID in header
-      }
-    });
-  }
-
-  private async handleMCPMessageViaSSE(request: Request): Promise<Response> {
-    console.log('=== PROCESSING MCP MESSAGE FOR SSE ===');
-    
-    try {
-      const message = await request.json();
-      console.log('MCP Message:', message);
-      
-      // Process the message
-      const response = await this.diceServer.handleMessage(message);
-      console.log('MCP Response:', response);
-
-      // If there's a response (not for notifications), send it via SSE
-      if (response) {
-        // Get connection ID from header or use default
-        const connectionId = request.headers.get('X-Connection-Id') || 'default';
-        const controller = this.connections.get(connectionId) || this.connections.values().next().value;
-        
-        if (controller) {
-          const encoder = new TextEncoder();
-          const sseData = `data: ${JSON.stringify(response)}\n\n`;
-          controller.enqueue(encoder.encode(sseData));
-        }
-      }
-
-      // Return 200 OK for the POST request
-      return new Response('OK', {
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-        }
-      });
-    } catch (error: any) {
-      console.error('Error processing MCP message:', error);
-      return new Response(JSON.stringify({
-        jsonrpc: "2.0",
-        id: null,
-        error: {
-          code: -32700,
-          message: `Parse error: ${error.message}`
-        }
-      }), {
-        status: 400,
-        headers: {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*',
-        }
-      });
-    }
-  }
-}
-
-// Alternative: Single-stream SSE implementation that handles both input and output
-// This might be what native MCP clients expect
-
-export class DiceMCPConnectionsSingleStream {
-  private state: DurableObjectState;
-  private env: Env;
-  private diceServer: DiceServer;
-
-  constructor(state: DurableObjectState, env: Env) {
-    this.state = state;
-    this.env = env;
-    this.diceServer = new DiceServer();
-  }
-
-  async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    const pathname = url.pathname;
-
-    // Single SSE endpoint that handles everything
-    if (pathname === '/sse' && request.method === 'GET') {
-      return this.handleBidirectionalSSE(request);
-    }
-
-    return new Response('Not found', { status: 404 });
-  }
-
-  private async handleBidirectionalSSE(request: Request): Promise<Response> {
-    console.log('=== BIDIRECTIONAL SSE CONNECTION ===');
-    
-    const encoder = new TextEncoder();
-    
-    // Create a transformer that processes incoming SSE messages
-    let messageBuffer = '';
-    
-    const stream = new ReadableStream({
-      start: async (controller) => {
-        // Send initial connection message
-        controller.enqueue(encoder.encode(': MCP SSE connection established\n\n'));
-        
-        // Handle incoming messages from request body (if any)
-        if (request.body) {
-          const reader = request.body.getReader();
-          
-          try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              
-              // Decode incoming data
-              const chunk = new TextDecoder().decode(value);
-              messageBuffer += chunk;
-              
-              // Process complete messages
-              const lines = messageBuffer.split('\n');
-              messageBuffer = lines.pop() || ''; // Keep incomplete line
-              
-              for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                  try {
-                    const messageData = line.substring(6);
-                    const message = JSON.parse(messageData);
-                    
-                    // Process MCP message
-                    const response = await this.diceServer.handleMessage(message);
-                    
-                    if (response) {
-                      // Send response back via SSE
-                      const responseData = `data: ${JSON.stringify(response)}\n\n`;
-                      controller.enqueue(encoder.encode(responseData));
-                    }
-                  } catch (error: any) {
-                    console.error('Error processing SSE message:', error);
-                    const errorResponse = {
-                      jsonrpc: "2.0",
-                      id: null,
-                      error: {
-                        code: -32700,
-                        message: `Parse error: ${error.message}`
-                      }
-                    };
-                    const errorData = `data: ${JSON.stringify(errorResponse)}\n\n`;
-                    controller.enqueue(encoder.encode(errorData));
-                  }
-                }
-              }
-            }
-          } catch (error) {
-            console.log('SSE stream ended or error:', error);
-          }
-        }
-        
-        // Set up heartbeat
-        const heartbeat = setInterval(() => {
-          try {
-            controller.enqueue(encoder.encode(': heartbeat\n\n'));
-          } catch (error) {
-            console.log('Client disconnected, clearing heartbeat');
-            clearInterval(heartbeat);
-          }
-        }, 30000);
-        
-        // Handle client disconnect
-        request.signal?.addEventListener('abort', () => {
-          console.log('Client disconnected');
-          clearInterval(heartbeat);
-          controller.close();
-        });
-      }
-    });
-
-    return new Response(stream, {
-      headers: {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-      }
-    });
-  }
-}
-
-  private async handleSSEConnection(request: Request): Promise<Response> {
-    console.log('=== DURABLE OBJECT SSE CONNECTION ===');
-    console.log('Headers:', Object.fromEntries(request.headers.entries()));
-
-    // Create a persistent SSE connection
-    const { readable, writable } = new TransformStream();
-    const writer = writable.getWriter();
-    const encoder = new TextEncoder();
-
-    // Send initial connection message
-    writer.write(encoder.encode(': MCP SSE connection established\n\n'));
-
-    // Keep connection alive with periodic heartbeats
-    const heartbeat = setInterval(() => {
-      try {
-        writer.write(encoder.encode(': heartbeat\n\n'));
-      } catch (error) {
-        console.log('Client disconnected, clearing heartbeat');
-        clearInterval(heartbeat);
-      }
-    }, 30000); // 30 second heartbeat
-
-    // Handle client disconnect
-    request.signal?.addEventListener('abort', () => {
-      console.log('Client disconnected');
-      clearInterval(heartbeat);
-      writer.close();
-    });
-
-    return new Response(readable, {
-      headers: {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-      }
-    });
-  }
-
-  private async handleMCPMessage(request: Request): Promise<Response> {
-    console.log('=== DURABLE OBJECT MCP MESSAGE ===');
-    
-    try {
-      const message = await request.json();
-      console.log('MCP Message:', message);
-      
-      const response = await this.diceServer.handleMessage(message);
-      console.log('MCP Response:', response);
-
-      return new Response(JSON.stringify(response), {
-        headers: {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*',
-        }
-      });
-    } catch (error: any) {
-      console.error('Error processing MCP message:', error);
-      return new Response(JSON.stringify({
-        jsonrpc: "2.0",
-        id: null,
-        error: {
-          code: -32700,
-          message: `Parse error: ${error.message}`
-        }
-      }), {
-        status: 400,
-        headers: {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*',
-        }
-      });
-    }
-  }
-}
-
-// Helper function to get base URL
-function getBaseUrl(request: Request): string {
-  const url = new URL(request.url);
-  return `${url.protocol}//${url.host}`;
-}
-
-// Helper function to validate auth (dummy validation for public server)
-const validateAuth = (request: Request): boolean => {
-  const authHeader = request.headers.get('Authorization');
-  if (!authHeader) return true; // Allow requests without auth for public server
-  
-  // Check for Bearer token format (dummy validation)
-  if (authHeader.startsWith('Bearer ')) {
-    const token = authHeader.substring(7);
-    return token.length > 10; // Dummy validation - just check it's not empty
-  }
-  
-  return false;
-};
-
-// Main Worker with Streamable HTTP support
+import { Env } from './types';
+import { McpDiceServer } from './mcp-server';
+import { SSEMcpTransport } from './sse-transport';
+import { getCorsHeaders, getBaseUrl } from './utils';
+
+// Main Cloudflare Worker
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const { pathname } = new URL(request.url);
+    const url = new URL(request.url);
+    const { pathname } = url;
     const baseUrl = getBaseUrl(request);
 
-    // Handle OPTIONS requests for CORS
+    // Handle CORS preflight
     if (request.method === 'OPTIONS') {
       return new Response(null, {
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, Authorization, Cache-Control',
-          'Access-Control-Max-Age': '86400',
-        }
+        status: 200,
+        headers: getCorsHeaders()
       });
     }
 
-    // OAuth Discovery endpoint for Claude.ai integrations
-    if (pathname === '/.well-known/oauth-authorization-server') {
-      const oauthConfig = {
-        issuer: baseUrl,
-        authorization_endpoint: `${baseUrl}/oauth/authorize`,
-        token_endpoint: `${baseUrl}/oauth/token`,
-        registration_endpoint: `${baseUrl}/register`,
-        grant_types_supported: ["authorization_code", "client_credentials"],
-        token_endpoint_auth_methods_supported: ["none", "client_secret_basic"],
-        response_types_supported: ["code", "token"],
-        scopes_supported: ["claudeai", "mcp"],
-        subjects_supported: ["public"],
-        code_challenge_methods_supported: ["S256", "plain"]
-      };
-
-      return new Response(JSON.stringify(oauthConfig), {
-        headers: {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*',
-        }
-      });
-    }
-
-    // Dynamic Client Registration endpoint
-    if (pathname === '/register' && request.method === 'POST') {
-      try {
-        const registration = await request.json();
-        
-        // Generate a dummy client ID (since we don't require real auth)
-        const clientId = `client_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-        
-        const clientInfo = {
-          client_id: clientId,
-          client_id_issued_at: Math.floor(Date.now() / 1000),
-          grant_types: ["authorization_code", "client_credentials"],
-          token_endpoint_auth_method: "none",
-          scope: "claudeai mcp",
-          redirect_uris: registration.redirect_uris || ["https://claude.ai/api/mcp/auth_callback"]
-        };
-
-        return new Response(JSON.stringify(clientInfo), {
-          status: 201,
-          headers: {
-            'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*',
-          }
-        });
-      } catch (error) {
-        return new Response(JSON.stringify({
-          error: "invalid_request",
-          error_description: "Invalid registration request"
-        }), {
-          status: 400,
-          headers: {
-            'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*',
-          }
-        });
-      }
-    }
-
-    // OAuth Authorization endpoint (for authorization code flow)
-    if (pathname === '/oauth/authorize' && request.method === 'GET') {
-      const url = new URL(request.url);
-      const clientId = url.searchParams.get('client_id');
-      const redirectUri = url.searchParams.get('redirect_uri');
-      const state = url.searchParams.get('state');
-      const scope = url.searchParams.get('scope');
-      const codeChallenge = url.searchParams.get('code_challenge');
-      const codeChallengeMethod = url.searchParams.get('code_challenge_method');
-
-      if (!clientId || !redirectUri) {
-        return new Response('Missing required parameters', { status: 400 });
-      }
-
-      // Generate a dummy authorization code
-      const authCode = `auth_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-      
-      // Store the code challenge for later verification (in a real app you'd use a database)
-      // For this demo, we'll just include it in the code itself
-      const encodedCodeChallenge = codeChallenge ? btoa(codeChallenge) : '';
-      const fullAuthCode = encodedCodeChallenge ? `${authCode}.${encodedCodeChallenge}` : authCode;
-
-      // Redirect back to Claude.ai with the authorization code
-      const redirectUrl = new URL(redirectUri);
-      redirectUrl.searchParams.set('code', fullAuthCode);
-      if (state) redirectUrl.searchParams.set('state', state);
-
-      return new Response(null, {
-        status: 302,
-        headers: {
-          'Location': redirectUrl.toString(),
-          'Access-Control-Allow-Origin': '*',
-        }
-      });
-    }
-
-    // OAuth Token endpoint (for client_credentials flow and authorization code exchange)
-    if (pathname === '/oauth/token' && request.method === 'POST') {
-      try {
-        const contentType = request.headers.get('content-type');
-        let grantType, code, clientId, codeVerifier;
-
-        if (contentType?.includes('application/x-www-form-urlencoded')) {
-          const formData = await request.formData();
-          grantType = formData.get('grant_type');
-          code = formData.get('code');
-          clientId = formData.get('client_id');
-          codeVerifier = formData.get('code_verifier');
-        } else {
-          const body = await request.json();
-          grantType = body.grant_type;
-          code = body.code;
-          clientId = body.client_id;
-          codeVerifier = body.code_verifier;
-        }
-
-        if (grantType === 'authorization_code') {
-          // Handle authorization code exchange
-          if (!code) {
-            return new Response(JSON.stringify({
-              error: "invalid_request",
-              error_description: "Missing authorization code"
-            }), {
-              status: 400,
-              headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-            });
-          }
-
-          // For demo purposes, we'll just verify the code format and generate a token
-          const token = {
-            access_token: `access_${Date.now()}_${Math.random().toString(36).substring(7)}`,
-            token_type: "Bearer",
-            expires_in: 3600,
-            scope: "claudeai"
-          };
-
-          return new Response(JSON.stringify(token), {
-            headers: {
-              'Content-Type': 'application/json',
-              'Access-Control-Allow-Origin': '*',
-            }
-          });
-        } else if (grantType === 'client_credentials') {
-          // Handle client credentials flow
-          const token = {
-            access_token: `token_${Date.now()}_${Math.random().toString(36).substring(7)}`,
-            token_type: "Bearer",
-            expires_in: 3600,
-            scope: "mcp"
-          };
-
-          return new Response(JSON.stringify(token), {
-            headers: {
-              'Content-Type': 'application/json',
-              'Access-Control-Allow-Origin': '*',
-            }
-          });
-        } else {
-          return new Response(JSON.stringify({
-            error: "unsupported_grant_type",
-            error_description: "Only authorization_code and client_credentials grant types are supported"
-          }), {
-            status: 400,
-            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-          });
-        }
-      } catch (error) {
-        return new Response(JSON.stringify({
-          error: "invalid_request",
-          error_description: "Invalid token request"
-        }), {
-          status: 400,
-          headers: {
-            'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*',
-          }
-        });
-      }
-    }
-
-    // MCP endpoint with Streamable HTTP transport (for future use)
+    // Main MCP endpoint (HTTP transport)
     if (pathname === '/mcp' && request.method === 'POST') {
-      if (!validateAuth(request)) {
-        return new Response('Unauthorized', { 
-          status: 401,
-          headers: {
-            'WWW-Authenticate': 'Bearer',
-            'Access-Control-Allow-Origin': '*',
-          }
-        });
-      }
-
-      console.log('=== MCP STREAMABLE HTTP REQUEST ===');
-      const body = await request.text();
-      console.log('Headers:', Object.fromEntries(request.headers.entries()));
-      console.log('Body:', body);
-      
       try {
-        const message = JSON.parse(body);
-        const response = await diceServer.handleMessage(message);
+        const mcpServer = new McpDiceServer();
+        const message = await request.json();
         
+        const response = await mcpServer.handleRequest(message);
+        
+        // Handle notifications (no response)
+        if (response === null) {
+          return new Response('', {
+            status: 204,
+            headers: getCorsHeaders()
+          });
+        }
+
         return new Response(JSON.stringify(response), {
+          status: 200,
           headers: {
             'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+            ...getCorsHeaders()
           }
         });
+
       } catch (error: any) {
-        return new Response(JSON.stringify({
+        console.error('MCP endpoint error:', error);
+        
+        const errorResponse = {
           jsonrpc: "2.0",
           id: null,
           error: {
             code: -32700,
-            message: `Parse error: ${error.message}`
+            message: "Parse error",
+            data: { details: error.message }
           }
-        }), {
+        };
+
+        return new Response(JSON.stringify(errorResponse), {
           status: 400,
           headers: {
             'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*',
+            ...getCorsHeaders()
           }
         });
       }
     }
 
-    // Legacy SSE endpoint - now uses Durable Objects for persistent connections
-    if (pathname.startsWith('/sse')) {
-      // Handle main /sse endpoint
-      if (pathname === '/sse') {
-        if (request.method === 'GET') {
-          // Use Durable Object for persistent SSE connection (Claude.ai integrations)
-          console.log('=== SSE GET REQUEST - USING DURABLE OBJECT ===');
-          console.log('Headers:', Object.fromEntries(request.headers.entries()));
-          
-          if (!validateAuth(request)) {
-            console.log('SSE GET request failed auth validation');
-            return new Response('Unauthorized', { 
-              status: 401,
-              headers: {
-                'WWW-Authenticate': 'Bearer',
-                'Access-Control-Allow-Origin': '*',
-              }
-            });
-          }
-
-          // Create Durable Object instance for this connection
-          const id = env.DICE_MCP_CONNECTIONS.idFromName('connection');
-          const durableObject = env.DICE_MCP_CONNECTIONS.get(id);
-          
-          // Forward request to Durable Object
-          const durableObjectUrl = new URL(request.url);
-          durableObjectUrl.pathname = '/connect';
-          
-          return durableObject.fetch(new Request(durableObjectUrl.toString(), {
-            method: 'GET',
-            headers: request.headers
-          }));
-        } else if (request.method === 'POST') {
-          // Handle direct MCP messages (for mcp-remote compatibility)
-          if (!validateAuth(request)) {
-            return new Response('Unauthorized', { 
-              status: 401,
-              headers: {
-                'WWW-Authenticate': 'Bearer',
-                'Access-Control-Allow-Origin': '*',
-              }
-            });
-          }
-
-          console.log('=== SSE POST REQUEST - DIRECT PROCESSING ===');
-          const diceServer = new DiceServer();
-          
-          try {
-            const message = await request.json();
-            const response = await diceServer.handleMessage(message);
-            
-            return new Response(JSON.stringify(response), {
-              headers: {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-              }
-            });
-          } catch (error: any) {
-            const errorResponse = {
-              jsonrpc: "2.0",
-              id: null,
-              error: {
-                code: -32700,
-                message: `Parse error: ${error.message}`
-              }
-            };
-            
-            return new Response(JSON.stringify(errorResponse), {
-              status: 400,
-              headers: {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-              }
-            });
-          }
-        }
-      }
-
-      // Handle /sse/messages endpoint (if Claude.ai uses this)
-      if (pathname === '/sse/messages' && request.method === 'POST') {
-        if (!validateAuth(request)) {
-          return new Response('Unauthorized', { 
-            status: 401,
-            headers: {
-              'WWW-Authenticate': 'Bearer',
-              'Access-Control-Allow-Origin': '*',
-            }
-          });
-        }
-
-        console.log('=== SSE MESSAGES POST REQUEST - USING DURABLE OBJECT ===');
-        
-        // Use Durable Object for message processing
-        const id = env.DICE_MCP_CONNECTIONS.idFromName('connection');
-        const durableObject = env.DICE_MCP_CONNECTIONS.get(id);
-        
-        // Forward request to Durable Object
-        const durableObjectUrl = new URL(request.url);
-        durableObjectUrl.pathname = '/message';
-        
-        return durableObject.fetch(new Request(durableObjectUrl.toString(), {
-          method: 'POST',
-          headers: request.headers,
-          body: request.body
-        }));
+    // SSE MCP endpoint (for legacy applications)
+    if (pathname === '/sse') {
+      const sseTransport = new SSEMcpTransport();
+      
+      if (request.method === 'GET') {
+        // Establish SSE connection
+        return sseTransport.handleSSEConnection(request);
+      } else if (request.method === 'POST') {
+        // Handle legacy POST-based messages
+        return sseTransport.handleSSEMessage(request);
       }
     }
 
-    // Health check endpoint for debugging
+    // Health check endpoint
     if (pathname === '/health') {
       return new Response(JSON.stringify({
         status: "healthy",
         timestamp: new Date().toISOString(),
         version: "2.0.0",
-        mcp_version: "2025-03-26",
-        transport: "streamable-http"
+        mcp_protocol: "2024-11-05",
+        transports: ["http", "sse"]
       }), {
         headers: {
           'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*',
+          ...getCorsHeaders()
         }
       });
     }
 
-    // Root endpoint with server info
-    if (pathname === '/') {
+    // Server info endpoint
+    if (pathname === '/' || pathname === '/info') {
       return new Response(JSON.stringify({
-        name: "Dice Rolling Server",
+        name: "Dice Rolling MCP Server",
         version: "2.0.0",
-        description: "A stateless Model Context Protocol server for rolling dice with advanced notation.",
-        transport: "streamable-http",
+        description: "A Model Context Protocol server for rolling dice with advanced notation support",
+        protocol: "MCP 2024-11-05",
+        transports: ["http", "sse"],
         endpoints: {
           mcp: `${baseUrl}/mcp`,
           sse: `${baseUrl}/sse`,
-          oauth_discovery: `${baseUrl}/.well-known/oauth-authorization-server`,
-          authorize: `${baseUrl}/oauth/authorize`,
-          register: `${baseUrl}/register`,
-          token: `${baseUrl}/oauth/token`,
-          health: `${baseUrl}/health`
+          health: `${baseUrl}/health`,
+          info: `${baseUrl}/`
         },
-        authentication: {
-          type: "oauth2",
-          flows: ["authorization_code", "client_credentials"],
-          required: false,
-          description: "Public server with dummy OAuth for Claude.ai integration compatibility"
+        capabilities: {
+          tools: ["roll"],
+          resources: false,
+          prompts: false,
+          logging: true
         },
         tools: [
           {
             name: "roll",
             description: "Roll dice using advanced notation",
             examples: [
-              "roll 2d6",
-              "roll 4d6k3",
-              "roll d20+5",
-              "roll 2d10!",
-              "roll (2d6+3)*2"
+              "2d6 - Roll two six-sided dice",
+              "4d6k3 - Roll 4d6, keep highest 3",
+              "d20+5 - Roll d20 and add 5",
+              "3d6! - Roll 3d6 with exploding dice",
+              "(2d6+3)*2 - Complex mathematical expression"
             ]
           }
         ],
+        usage: {
+          http_transport: {
+            description: "Standard MCP over HTTP",
+            endpoint: `${baseUrl}/mcp`,
+            method: "POST",
+            content_type: "application/json"
+          },
+          sse_transport: {
+            description: "MCP over Server-Sent Events",
+            endpoint: `${baseUrl}/sse`,
+            method_connect: "GET",
+            method_message: "POST (legacy) or data: events",
+            content_type: "text/event-stream"
+          }
+        },
         dice_notation: {
           basic: "NdX (e.g., 2d6, d20, d%)",
+          fudge: "NdF (FATE dice: -1, 0, +1)",
           keep_drop: "NdXkY (keep highest Y), NdXdY (drop lowest Y)",
           exploding: "NdX! (explode on max), NdXeY (explode on Y+)",
-          reroll: "NdXrY (reroll if result is Y or less)",
-          fudge: "NdF (FATE dice: -1, 0, +1)",
-          math: "Supports +, -, *, parentheses",
+          reroll: "NdXrY (reroll if result ≤ Y)",
+          math: "Full mathematical expressions with +, -, *, parentheses",
           limits: {
             dice_count: "1-1,000",
             dice_sides: "1-10,000",
@@ -1278,11 +158,15 @@ export default {
       }, null, 2), {
         headers: {
           'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*',
+          ...getCorsHeaders()
         }
       });
     }
 
-    return new Response('Not found', { status: 404 });
+    // 404 for everything else
+    return new Response('Not Found', { 
+      status: 404,
+      headers: getCorsHeaders()
+    });
   },
 };
