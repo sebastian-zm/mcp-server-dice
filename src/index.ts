@@ -765,20 +765,49 @@ export default {
     }
 
     // MCP endpoint with Streamable HTTP transport
-    if (pathname === '/mcp' && request.method === 'POST') {
-      // Debug logging - temporarily log all requests
-      const body = await request.text();
-      console.log('=== MCP REQUEST ===');
-      console.log('Headers:', Object.fromEntries(request.headers.entries()));
-      console.log('Body:', body);
-      
-      // Recreate request for processing
-      const newRequest = new Request(request.url, {
-        method: request.method,
-        headers: request.headers,
-        body: body
-      });
-      return handleStreamableHTTPRequest(newRequest);
+    if (pathname === '/mcp') {
+      if (request.method === 'GET') {
+        // Handle initial connection for Claude.ai integrations
+        if (!validateAuth(request)) {
+          return new Response('Unauthorized', { 
+            status: 401,
+            headers: {
+              'WWW-Authenticate': 'Bearer',
+              'Access-Control-Allow-Origin': '*',
+            }
+          });
+        }
+
+        // Send initial SSE connection for Claude.ai integrations
+        const sseData = [
+          'data: {"type":"connection","status":"connected"}\n\n',
+          'data: {"type":"server_info","name":"Dice Rolling Server","version":"2.0.0"}\n\n'
+        ].join('');
+
+        return new Response(sseData, {
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+          }
+        });
+      } else if (request.method === 'POST') {
+        // Debug logging - temporarily log all requests
+        const body = await request.text();
+        console.log('=== MCP REQUEST ===');
+        console.log('Headers:', Object.fromEntries(request.headers.entries()));
+        console.log('Body:', body);
+        
+        // Recreate request for processing
+        const newRequest = new Request(request.url, {
+          method: request.method,
+          headers: request.headers,
+          body: body
+        });
+        return handleStreamableHTTPRequest(newRequest);
+      }
     }
 
     // Legacy SSE endpoint for backward compatibility (keep for mcp-remote)
