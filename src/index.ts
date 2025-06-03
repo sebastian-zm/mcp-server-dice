@@ -491,10 +491,13 @@ type DiceResult = {
 const diceServer = new DiceServer();
 
 // Durable Object for handling persistent MCP connections
+// Add this to your DiceMCPConnections class
+
 export class DiceMCPConnections {
   private state: DurableObjectState;
   private env: Env;
   private diceServer: DiceServer;
+  private connections: Map<string, ReadableStreamDefaultController> = new Map();
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -513,13 +516,249 @@ export class DiceMCPConnections {
       return this.handleSSEConnection(request);
     }
 
-    // Handle MCP message processing
+    // Handle MCP message processing via SSE
     if (pathname === '/message' && request.method === 'POST') {
-      return this.handleMCPMessage(request);
+      return this.handleMCPMessageViaSSE(request);
     }
 
     return new Response('Not found', { status: 404 });
   }
+
+  private async handleSSEConnection(request: Request): Promise<Response> {
+    console.log('=== ESTABLISHING SSE CONNECTION ===');
+    
+    const connectionId = `conn_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+    
+    // Create SSE stream
+    const stream = new ReadableStream({
+      start: (controller) => {
+        // Store controller for sending responses
+        this.connections.set(connectionId, controller);
+        
+        // Send initial connection message
+        const encoder = new TextEncoder();
+        controller.enqueue(encoder.encode(': MCP SSE connection established\n\n'));
+        
+        // Optional: Send connection ID to client
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+          jsonrpc: "2.0",
+          method: "notifications/connection_established",
+          params: { connectionId }
+        })}\n\n`));
+      },
+      cancel: () => {
+        console.log(`Connection ${connectionId} cancelled`);
+        this.connections.delete(connectionId);
+      }
+    });
+
+    // Set up heartbeat for this connection
+    const heartbeatInterval = setInterval(() => {
+      const controller = this.connections.get(connectionId);
+      if (controller) {
+        try {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode(': heartbeat\n\n'));
+        } catch (error) {
+          console.log(`Connection ${connectionId} closed, clearing heartbeat`);
+          clearInterval(heartbeatInterval);
+          this.connections.delete(connectionId);
+        }
+      } else {
+        clearInterval(heartbeatInterval);
+      }
+    }, 30000);
+
+    // Handle client disconnect
+    request.signal?.addEventListener('abort', () => {
+      console.log(`Client disconnected: ${connectionId}`);
+      clearInterval(heartbeatInterval);
+      this.connections.delete(connectionId);
+    });
+
+    return new Response(stream, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+        'X-Connection-Id': connectionId, // Send connection ID in header
+      }
+    });
+  }
+
+  private async handleMCPMessageViaSSE(request: Request): Promise<Response> {
+    console.log('=== PROCESSING MCP MESSAGE FOR SSE ===');
+    
+    try {
+      const message = await request.json();
+      console.log('MCP Message:', message);
+      
+      // Process the message
+      const response = await this.diceServer.handleMessage(message);
+      console.log('MCP Response:', response);
+
+      // If there's a response (not for notifications), send it via SSE
+      if (response) {
+        // Get connection ID from header or use default
+        const connectionId = request.headers.get('X-Connection-Id') || 'default';
+        const controller = this.connections.get(connectionId) || this.connections.values().next().value;
+        
+        if (controller) {
+          const encoder = new TextEncoder();
+          const sseData = `data: ${JSON.stringify(response)}\n\n`;
+          controller.enqueue(encoder.encode(sseData));
+        }
+      }
+
+      // Return 200 OK for the POST request
+      return new Response('OK', {
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+        }
+      });
+    } catch (error: any) {
+      console.error('Error processing MCP message:', error);
+      return new Response(JSON.stringify({
+        jsonrpc: "2.0",
+        id: null,
+        error: {
+          code: -32700,
+          message: `Parse error: ${error.message}`
+        }
+      }), {
+        status: 400,
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+        }
+      });
+    }
+  }
+}
+
+// Alternative: Single-stream SSE implementation that handles both input and output
+// This might be what native MCP clients expect
+
+export class DiceMCPConnectionsSingleStream {
+  private state: DurableObjectState;
+  private env: Env;
+  private diceServer: DiceServer;
+
+  constructor(state: DurableObjectState, env: Env) {
+    this.state = state;
+    this.env = env;
+    this.diceServer = new DiceServer();
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const pathname = url.pathname;
+
+    // Single SSE endpoint that handles everything
+    if (pathname === '/sse' && request.method === 'GET') {
+      return this.handleBidirectionalSSE(request);
+    }
+
+    return new Response('Not found', { status: 404 });
+  }
+
+  private async handleBidirectionalSSE(request: Request): Promise<Response> {
+    console.log('=== BIDIRECTIONAL SSE CONNECTION ===');
+    
+    const encoder = new TextEncoder();
+    
+    // Create a transformer that processes incoming SSE messages
+    let messageBuffer = '';
+    
+    const stream = new ReadableStream({
+      start: async (controller) => {
+        // Send initial connection message
+        controller.enqueue(encoder.encode(': MCP SSE connection established\n\n'));
+        
+        // Handle incoming messages from request body (if any)
+        if (request.body) {
+          const reader = request.body.getReader();
+          
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              
+              // Decode incoming data
+              const chunk = new TextDecoder().decode(value);
+              messageBuffer += chunk;
+              
+              // Process complete messages
+              const lines = messageBuffer.split('\n');
+              messageBuffer = lines.pop() || ''; // Keep incomplete line
+              
+              for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                  try {
+                    const messageData = line.substring(6);
+                    const message = JSON.parse(messageData);
+                    
+                    // Process MCP message
+                    const response = await this.diceServer.handleMessage(message);
+                    
+                    if (response) {
+                      // Send response back via SSE
+                      const responseData = `data: ${JSON.stringify(response)}\n\n`;
+                      controller.enqueue(encoder.encode(responseData));
+                    }
+                  } catch (error: any) {
+                    console.error('Error processing SSE message:', error);
+                    const errorResponse = {
+                      jsonrpc: "2.0",
+                      id: null,
+                      error: {
+                        code: -32700,
+                        message: `Parse error: ${error.message}`
+                      }
+                    };
+                    const errorData = `data: ${JSON.stringify(errorResponse)}\n\n`;
+                    controller.enqueue(encoder.encode(errorData));
+                  }
+                }
+              }
+            }
+          } catch (error) {
+            console.log('SSE stream ended or error:', error);
+          }
+        }
+        
+        // Set up heartbeat
+        const heartbeat = setInterval(() => {
+          try {
+            controller.enqueue(encoder.encode(': heartbeat\n\n'));
+          } catch (error) {
+            console.log('Client disconnected, clearing heartbeat');
+            clearInterval(heartbeat);
+          }
+        }, 30000);
+        
+        // Handle client disconnect
+        request.signal?.addEventListener('abort', () => {
+          console.log('Client disconnected');
+          clearInterval(heartbeat);
+          controller.close();
+        });
+      }
+    });
+
+    return new Response(stream, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+      }
+    });
+  }
+}
 
   private async handleSSEConnection(request: Request): Promise<Response> {
     console.log('=== DURABLE OBJECT SSE CONNECTION ===');
