@@ -4,13 +4,12 @@ import { z } from "zod";
 
 interface Env {
   DICE_KV: KVNamespace;
+  DICE_MCP: DurableObjectNamespace;
   ACCESS_AUD?: string;
   ACCESS_TEAM_DOMAIN?: string;
 }
 
-// Simplified version without auth context in tool handlers
-// Rate limiting will be simplified for now
-
+// Durable Object implementation
 export class DiceMCP extends McpAgent<Env> {
   server = new McpServer({
     name: "Dice Rolling Server",
@@ -18,9 +17,43 @@ export class DiceMCP extends McpAgent<Env> {
   });
 
   private parser = new DiceParser();
+  private sql: SqlStorage;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super();
+    // Initialize SQLite storage
+    this.sql = ctx.storage.sql;
+    
+    // Initialize database tables
+    this.initializeDatabase();
+  }
+
+  private async initializeDatabase() {
+    // Create tables for storing dice roll history, user preferences, etc.
+    await this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS dice_rolls (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp INTEGER,
+        expression TEXT,
+        result INTEGER,
+        breakdown TEXT,
+        user_id TEXT,
+        description TEXT
+      )
+    `);
+
+    await this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS user_preferences (
+        user_id TEXT PRIMARY KEY,
+        default_notation TEXT,
+        history_enabled BOOLEAN DEFAULT true,
+        created_at INTEGER
+      )
+    `);
+  }
 
   async init() {
-    // Universal dice rolling tool - simplified without rate limiting for now
+    // Universal dice rolling tool with history tracking
     this.server.tool(
       "roll",
       {
@@ -33,11 +66,24 @@ export class DiceMCP extends McpAgent<Env> {
 • Math: d20+5, 2d6+1d4-2
 • Multiplication: 3*(2d6+1), 2×(d4+d6)
 • Complex: (2d6+3)*2+1d4-3d8k2`),
-        description: z.string().optional().describe("Optional description of what this roll is for")
+        description: z.string().optional().describe("Optional description of what this roll is for"),
+        save_to_history: z.boolean().optional().default(true).describe("Whether to save this roll to history")
       },
-      async ({ expression, description }) => {
+      async ({ expression, description, save_to_history }) => {
         try {
           const result = this.parser.parse(expression);
+
+          // Save to history if requested
+          if (save_to_history) {
+            await this.saveRollToHistory({
+              expression: result.expression,
+              result: result.total,
+              breakdown: result.breakdown,
+              description: description || null,
+              user_id: 'default', // You could extract this from request context
+              timestamp: Date.now()
+            });
+          }
 
           let output = `🎲 **${result.expression}**`;
           if (description) {
@@ -61,10 +107,128 @@ export class DiceMCP extends McpAgent<Env> {
       },
       "Roll dice using advanced notation. Supports complex expressions, keep/drop, exploding dice, and more."
     );
+
+    // Add history tool
+    this.server.tool(
+      "roll_history",
+      {
+        limit: z.number().optional().default(10).describe("Number of recent rolls to retrieve"),
+        user_id: z.string().optional().default('default').describe("User ID to get history for")
+      },
+      async ({ limit, user_id }) => {
+        const rolls = await this.getRollHistory(user_id, limit);
+        
+        if (rolls.length === 0) {
+          return {
+            content: [{ type: "text", text: "📜 No dice roll history found." }]
+          };
+        }
+
+        let output = `📜 **Recent Dice Rolls** (${rolls.length} results)\n\n`;
+        for (const roll of rolls) {
+          const date = new Date(roll.timestamp).toLocaleString();
+          output += `• **${roll.expression}** = ${roll.result}`;
+          if (roll.description) {
+            output += ` *(${roll.description})*`;
+          }
+          output += `\n  ${roll.breakdown}\n  *${date}*\n\n`;
+        }
+
+        return {
+          content: [{ type: "text", text: output }]
+        };
+      },
+      "Get history of recent dice rolls"
+    );
+
+    // Clear history tool
+    this.server.tool(
+      "clear_history",
+      {
+        user_id: z.string().optional().default('default').describe("User ID to clear history for"),
+        confirm: z.boolean().describe("Must be true to confirm deletion")
+      },
+      async ({ user_id, confirm }) => {
+        if (!confirm) {
+          return {
+            content: [{ 
+              type: "text", 
+              text: "❌ **Confirmation required**: Set `confirm: true` to clear history." 
+            }]
+          };
+        }
+
+        const result = await this.sql.exec(
+          "DELETE FROM dice_rolls WHERE user_id = ?",
+          user_id
+        );
+
+        return {
+          content: [{ 
+            type: "text", 
+            text: `✅ **History cleared**: Deleted ${result.changes} roll records for user ${user_id}.` 
+          }]
+        };
+      },
+      "Clear dice roll history for a user"
+    );
+  }
+
+  // Durable Object fetch method
+  async fetch(request: Request): Promise<Response> {
+    // Initialize the MCP agent if not already done
+    if (!this.server.listTools().length) {
+      await this.init();
+    }
+
+    // Handle MCP requests through the agent
+    return await super.fetch(request);
+  }
+
+  // Helper methods for database operations
+  private async saveRollToHistory(roll: {
+    expression: string;
+    result: number;
+    breakdown: string;
+    description: string | null;
+    user_id: string;
+    timestamp: number;
+  }) {
+    await this.sql.exec(
+      `INSERT INTO dice_rolls (expression, result, breakdown, description, user_id, timestamp)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      roll.expression,
+      roll.result,
+      roll.breakdown,
+      roll.description,
+      roll.user_id,
+      roll.timestamp
+    );
+  }
+
+  private async getRollHistory(user_id: string, limit: number) {
+    const result = await this.sql.exec(
+      `SELECT * FROM dice_rolls 
+       WHERE user_id = ? 
+       ORDER BY timestamp DESC 
+       LIMIT ?`,
+      user_id,
+      limit
+    );
+
+    return result.results.map(row => ({
+      id: row.id as number,
+      expression: row.expression as string,
+      result: row.result as number,
+      breakdown: row.breakdown as string,
+      description: row.description as string | null,
+      user_id: row.user_id as string,
+      timestamp: row.timestamp as number
+    }));
   }
 }
 
-// Dice notation parser
+// Dice notation parser (same as before)
 class DiceParser {
   private position = 0;
   private input = "";
@@ -377,6 +541,7 @@ interface DiceResult {
   breakdown: string;
 }
 
+// Main Worker
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const { pathname } = new URL(request.url);
@@ -392,21 +557,23 @@ export default {
       });
     }
 
-    // MCP endpoints
-    if (pathname.startsWith('/sse')) {
-      return DiceMCP.serveSSE('/sse').fetch(request, env, ctx);
-    }
-    
-    if (pathname.startsWith('/mcp')) {
-      return DiceMCP.serve('/mcp').fetch(request, env, ctx);
+    // Route MCP requests to the Durable Object
+    if (pathname.startsWith('/sse') || pathname.startsWith('/mcp')) {
+      // Get a Durable Object instance
+      const id = env.DICE_MCP.idFromName('dice-mcp-instance');
+      const durableObject = env.DICE_MCP.get(id);
+      
+      // Forward the request to the Durable Object
+      return durableObject.fetch(request);
     }
 
-    // Root endpoint with server info
+    // Root endpoint with server info (updated with new tools)
     if (pathname === '/') {
       return new Response(JSON.stringify({
         name: "Dice Rolling Server",
         version: "2.0.0",
-        description: "A Model Context Protocol server for rolling dice with advanced notation.",
+        description: "A Model Context Protocol server for rolling dice with advanced notation and SQLite-backed history.",
+        storage: "SQLite Durable Objects",
         endpoints: {
           sse: new URL('/sse', request.url).href,
           mcp: new URL('/mcp', request.url).href
@@ -414,13 +581,28 @@ export default {
         tools: [
           {
             name: "roll",
-            description: "Roll dice with advanced notation",
+            description: "Roll dice with advanced notation and optional history saving",
             examples: [
               "roll 2d6",
               "roll 4d6k3",
               "roll d20+5",
               "roll 2d10!",
               "roll (2d6+3)*2"
+            ]
+          },
+          {
+            name: "roll_history",
+            description: "Get history of recent dice rolls",
+            examples: [
+              "roll_history",
+              "roll_history limit=5"
+            ]
+          },
+          {
+            name: "clear_history",
+            description: "Clear dice roll history",
+            examples: [
+              "clear_history confirm=true"
             ]
           }
         ],
