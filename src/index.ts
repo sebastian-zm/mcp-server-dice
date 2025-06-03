@@ -488,6 +488,7 @@ export default {
           'Access-Control-Allow-Origin': '*',
           'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
           'Access-Control-Allow-Headers': 'Content-Type, Authorization, Cache-Control',
+          'Access-Control-Max-Age': '86400',
         }
       });
     }
@@ -499,11 +500,12 @@ export default {
         authorization_endpoint: `${baseUrl}/oauth/authorize`,
         token_endpoint: `${baseUrl}/oauth/token`,
         registration_endpoint: `${baseUrl}/register`,
-        grant_types_supported: ["client_credentials"],
+        grant_types_supported: ["authorization_code", "client_credentials"],
         token_endpoint_auth_methods_supported: ["none", "client_secret_basic"],
-        response_types_supported: ["token"],
-        scopes_supported: ["mcp"],
-        subjects_supported: ["public"]
+        response_types_supported: ["code", "token"],
+        scopes_supported: ["claudeai", "mcp"],
+        subjects_supported: ["public"],
+        code_challenge_methods_supported: ["S256", "plain"]
       };
 
       return new Response(JSON.stringify(oauthConfig), {
@@ -525,9 +527,10 @@ export default {
         const clientInfo = {
           client_id: clientId,
           client_id_issued_at: Math.floor(Date.now() / 1000),
-          grant_types: ["client_credentials"],
+          grant_types: ["authorization_code", "client_credentials"],
           token_endpoint_auth_method: "none",
-          scope: "mcp"
+          scope: "claudeai mcp",
+          redirect_uris: registration.redirect_uris || ["https://claude.ai/api/mcp/auth_callback"]
         };
 
         return new Response(JSON.stringify(clientInfo), {
@@ -551,23 +554,112 @@ export default {
       }
     }
 
-    // OAuth Token endpoint (for client_credentials flow)
+    // OAuth Authorization endpoint (for authorization code flow)
+    if (pathname === '/oauth/authorize' && request.method === 'GET') {
+      const url = new URL(request.url);
+      const clientId = url.searchParams.get('client_id');
+      const redirectUri = url.searchParams.get('redirect_uri');
+      const state = url.searchParams.get('state');
+      const scope = url.searchParams.get('scope');
+      const codeChallenge = url.searchParams.get('code_challenge');
+      const codeChallengeMethod = url.searchParams.get('code_challenge_method');
+
+      if (!clientId || !redirectUri) {
+        return new Response('Missing required parameters', { status: 400 });
+      }
+
+      // Generate a dummy authorization code
+      const authCode = `auth_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+      
+      // Store the code challenge for later verification (in a real app you'd use a database)
+      // For this demo, we'll just include it in the code itself
+      const encodedCodeChallenge = codeChallenge ? btoa(codeChallenge) : '';
+      const fullAuthCode = encodedCodeChallenge ? `${authCode}.${encodedCodeChallenge}` : authCode;
+
+      // Redirect back to Claude.ai with the authorization code
+      const redirectUrl = new URL(redirectUri);
+      redirectUrl.searchParams.set('code', fullAuthCode);
+      if (state) redirectUrl.searchParams.set('state', state);
+
+      return new Response(null, {
+        status: 302,
+        headers: {
+          'Location': redirectUrl.toString(),
+          'Access-Control-Allow-Origin': '*',
+        }
+      });
+    }
+
+    // OAuth Token endpoint (for client_credentials flow and authorization code exchange)
     if (pathname === '/oauth/token' && request.method === 'POST') {
       try {
-        // Since we don't require real authentication, just return a dummy token
-        const token = {
-          access_token: `token_${Date.now()}_${Math.random().toString(36).substring(7)}`,
-          token_type: "Bearer",
-          expires_in: 3600,
-          scope: "mcp"
-        };
+        const contentType = request.headers.get('content-type');
+        let grantType, code, clientId, codeVerifier;
 
-        return new Response(JSON.stringify(token), {
-          headers: {
-            'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*',
+        if (contentType?.includes('application/x-www-form-urlencoded')) {
+          const formData = await request.formData();
+          grantType = formData.get('grant_type');
+          code = formData.get('code');
+          clientId = formData.get('client_id');
+          codeVerifier = formData.get('code_verifier');
+        } else {
+          const body = await request.json();
+          grantType = body.grant_type;
+          code = body.code;
+          clientId = body.client_id;
+          codeVerifier = body.code_verifier;
+        }
+
+        if (grantType === 'authorization_code') {
+          // Handle authorization code exchange
+          if (!code) {
+            return new Response(JSON.stringify({
+              error: "invalid_request",
+              error_description: "Missing authorization code"
+            }), {
+              status: 400,
+              headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+            });
           }
-        });
+
+          // For demo purposes, we'll just verify the code format and generate a token
+          const token = {
+            access_token: `access_${Date.now()}_${Math.random().toString(36).substring(7)}`,
+            token_type: "Bearer",
+            expires_in: 3600,
+            scope: "claudeai"
+          };
+
+          return new Response(JSON.stringify(token), {
+            headers: {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*',
+            }
+          });
+        } else if (grantType === 'client_credentials') {
+          // Handle client credentials flow
+          const token = {
+            access_token: `token_${Date.now()}_${Math.random().toString(36).substring(7)}`,
+            token_type: "Bearer",
+            expires_in: 3600,
+            scope: "mcp"
+          };
+
+          return new Response(JSON.stringify(token), {
+            headers: {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*',
+            }
+          });
+        } else {
+          return new Response(JSON.stringify({
+            error: "unsupported_grant_type",
+            error_description: "Only authorization_code and client_credentials grant types are supported"
+          }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+          });
+        }
       } catch (error) {
         return new Response(JSON.stringify({
           error: "invalid_request",
@@ -582,17 +674,48 @@ export default {
       }
     }
 
+    // Helper function to validate auth (dummy validation for public server)
+    const validateAuth = (request: Request): boolean => {
+      const authHeader = request.headers.get('Authorization');
+      if (!authHeader) return true; // Allow requests without auth for public server
+      
+      // Check for Bearer token format (dummy validation)
+      if (authHeader.startsWith('Bearer ')) {
+        const token = authHeader.substring(7);
+        return token.length > 10; // Dummy validation - just check it's not empty
+      }
+      
+      return false;
+    };
+
     // Handle SSE endpoint
     if (pathname.startsWith('/sse')) {
+      // Validate authentication
+      if (!validateAuth(request)) {
+        return new Response('Unauthorized', { 
+          status: 401,
+          headers: {
+            'WWW-Authenticate': 'Bearer',
+            'Access-Control-Allow-Origin': '*',
+          }
+        });
+      }
+
       if (request.method === 'GET') {
-        // Initial SSE connection
-        return new Response(null, {
+        // Initial SSE connection - send a proper SSE response
+        const sseData = [
+          'data: {"type":"connection","status":"connected"}\n\n',
+          'data: {"type":"server_info","name":"Dice Rolling Server","version":"2.0.0"}\n\n'
+        ].join('');
+
+        return new Response(sseData, {
           status: 200,
           headers: {
             'Content-Type': 'text/event-stream',
             'Cache-Control': 'no-cache',
             'Connection': 'keep-alive',
             'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Authorization, Content-Type',
           }
         });
       } else if (request.method === 'POST') {
@@ -605,6 +728,7 @@ export default {
             headers: {
               'Content-Type': 'application/json',
               'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Authorization, Content-Type',
             }
           });
         } catch (error: any) {
@@ -622,6 +746,7 @@ export default {
             headers: {
               'Content-Type': 'application/json',
               'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Authorization, Content-Type',
             }
           });
         }
@@ -630,6 +755,17 @@ export default {
     
     // Handle MCP endpoint (HTTP transport)
     if (pathname.startsWith('/mcp') && request.method === 'POST') {
+      // Validate authentication
+      if (!validateAuth(request)) {
+        return new Response('Unauthorized', { 
+          status: 401,
+          headers: {
+            'WWW-Authenticate': 'Bearer',
+            'Access-Control-Allow-Origin': '*',
+          }
+        });
+      }
+
       try {
         const message = await request.json();
         const response = await diceServer.handleMessage(message);
@@ -638,6 +774,7 @@ export default {
           headers: {
             'Content-Type': 'application/json',
             'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Authorization, Content-Type',
           }
         });
       } catch (error: any) {
@@ -655,9 +792,25 @@ export default {
           headers: {
             'Content-Type': 'application/json',
             'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Authorization, Content-Type',
           }
         });
       }
+    }
+
+    // Health check endpoint for debugging
+    if (pathname === '/health') {
+      return new Response(JSON.stringify({
+        status: "healthy",
+        timestamp: new Date().toISOString(),
+        version: "2.0.0",
+        mcp_version: "2024-11-05"
+      }), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+        }
+      });
     }
 
     // Root endpoint with server info
@@ -670,12 +823,13 @@ export default {
           sse: `${baseUrl}/sse`,
           mcp: `${baseUrl}/mcp`,
           oauth_discovery: `${baseUrl}/.well-known/oauth-authorization-server`,
+          authorize: `${baseUrl}/oauth/authorize`,
           register: `${baseUrl}/register`,
           token: `${baseUrl}/oauth/token`
         },
         authentication: {
           type: "oauth2",
-          flow: "client_credentials",
+          flows: ["authorization_code", "client_credentials"],
           required: false,
           description: "Public server with dummy OAuth for Claude.ai integration compatibility"
         },
