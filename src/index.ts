@@ -766,38 +766,7 @@ export default {
 
     // MCP endpoint with Streamable HTTP transport
     if (pathname === '/mcp') {
-      if (request.method === 'GET') {
-        // Debug logging for GET requests
-        console.log('=== MCP GET REQUEST ===');
-        console.log('Headers:', Object.fromEntries(request.headers.entries()));
-        console.log('URL:', request.url);
-        
-        // Handle initial connection for Claude.ai integrations
-        if (!validateAuth(request)) {
-          console.log('GET request failed auth validation');
-          return new Response('Unauthorized', { 
-            status: 401,
-            headers: {
-              'WWW-Authenticate': 'Bearer',
-              'Access-Control-Allow-Origin': '*',
-            }
-          });
-        }
-
-        console.log('GET request passed auth, sending SSE connection');
-        
-        // Send minimal SSE connection for Claude.ai integrations
-        // Just establish the connection without custom messages
-        return new Response('', {
-          headers: {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-          }
-        });
-      } else if (request.method === 'POST') {
+      if (request.method === 'POST') {
         // Debug logging - temporarily log all requests
         const body = await request.text();
         console.log('=== MCP POST REQUEST ===');
@@ -811,6 +780,17 @@ export default {
           body: body
         });
         return handleStreamableHTTPRequest(newRequest);
+      } else {
+        // Log any non-POST requests to /mcp
+        console.log(`=== MCP ${request.method} REQUEST (NOT SUPPORTED) ===`);
+        console.log('Headers:', Object.fromEntries(request.headers.entries()));
+        return new Response(`Method ${request.method} not allowed`, { 
+          status: 405,
+          headers: {
+            'Allow': 'POST',
+            'Access-Control-Allow-Origin': '*',
+          }
+        });
       }
     }
 
