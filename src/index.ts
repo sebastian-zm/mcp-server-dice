@@ -81,9 +81,12 @@ class DiceServer {
           jsonrpc: "2.0",
           id: message.id,
           result: {
-            protocolVersion: "2024-11-05",
+            protocolVersion: "2025-03-26",
             capabilities: {
-              tools: {}
+              tools: {},
+              resources: {},
+              prompts: {},
+              logging: {}
             },
             serverInfo: {
               name: "Dice Rolling Server",
@@ -833,7 +836,7 @@ export default {
         status: "healthy",
         timestamp: new Date().toISOString(),
         version: "2.0.0",
-        mcp_version: "2024-11-05",
+        mcp_version: "2025-03-26",
         transport: "streamable-http"
       }), {
         headers: {
