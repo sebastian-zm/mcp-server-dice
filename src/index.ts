@@ -508,39 +508,19 @@ async function handleStreamableHTTPRequest(request: Request): Promise<Response> 
     const message = await request.json();
     const response = await diceServer.handleMessage(message);
     
-    // For Streamable HTTP, we can respond immediately for most operations
-    // Only upgrade to SSE if we need to stream multiple responses
-    const shouldStream = false; // For dice rolling, we don't need streaming
+    // For Claude.ai integrations, always respond with SSE format
+    // This ensures compatibility with their expected transport behavior
+    const sseData = `data: ${JSON.stringify(response)}\n\n`;
     
-    if (shouldStream) {
-      // Upgrade to SSE for streaming (not needed for dice rolling)
-      const stream = new ReadableStream({
-        start(controller) {
-          const data = `data: ${JSON.stringify(response)}\n\n`;
-          controller.enqueue(new TextEncoder().encode(data));
-          controller.close();
-        }
-      });
-      
-      return new Response(stream, {
-        headers: {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          'Connection': 'keep-alive',
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-        }
-      });
-    } else {
-      // Immediate JSON response for simple operations
-      return new Response(JSON.stringify(response), {
-        headers: {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-        }
-      });
-    }
+    return new Response(sseData, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+      }
+    });
   } catch (error: any) {
     const errorResponse = {
       jsonrpc: "2.0",
@@ -551,10 +531,13 @@ async function handleStreamableHTTPRequest(request: Request): Promise<Response> 
       }
     };
     
-    return new Response(JSON.stringify(errorResponse), {
+    const sseData = `data: ${JSON.stringify(errorResponse)}\n\n`;
+    
+    return new Response(sseData, {
       status: 400,
       headers: {
-        'Content-Type': 'application/json',
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Headers': 'Authorization, Content-Type',
       }
