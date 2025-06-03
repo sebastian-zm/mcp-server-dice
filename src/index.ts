@@ -475,7 +475,91 @@ function getBaseUrl(request: Request): string {
   return `${url.protocol}//${url.host}`;
 }
 
-// Main Worker with OAuth support for Claude.ai integrations
+// Helper function to validate auth (dummy validation for public server)
+const validateAuth = (request: Request): boolean => {
+  const authHeader = request.headers.get('Authorization');
+  if (!authHeader) return true; // Allow requests without auth for public server
+  
+  // Check for Bearer token format (dummy validation)
+  if (authHeader.startsWith('Bearer ')) {
+    const token = authHeader.substring(7);
+    return token.length > 10; // Dummy validation - just check it's not empty
+  }
+  
+  return false;
+};
+
+// Helper function to handle Streamable HTTP responses
+async function handleStreamableHTTPRequest(request: Request): Promise<Response> {
+  if (!validateAuth(request)) {
+    return new Response('Unauthorized', { 
+      status: 401,
+      headers: {
+        'WWW-Authenticate': 'Bearer',
+        'Access-Control-Allow-Origin': '*',
+      }
+    });
+  }
+
+  try {
+    const message = await request.json();
+    const response = await diceServer.handleMessage(message);
+    
+    // For Streamable HTTP, we can respond immediately for most operations
+    // Only upgrade to SSE if we need to stream multiple responses
+    const shouldStream = false; // For dice rolling, we don't need streaming
+    
+    if (shouldStream) {
+      // Upgrade to SSE for streaming (not needed for dice rolling)
+      const stream = new ReadableStream({
+        start(controller) {
+          const data = `data: ${JSON.stringify(response)}\n\n`;
+          controller.enqueue(new TextEncoder().encode(data));
+          controller.close();
+        }
+      });
+      
+      return new Response(stream, {
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+        }
+      });
+    } else {
+      // Immediate JSON response for simple operations
+      return new Response(JSON.stringify(response), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+        }
+      });
+    }
+  } catch (error: any) {
+    const errorResponse = {
+      jsonrpc: "2.0",
+      id: null,
+      error: {
+        code: -32700,
+        message: `Parse error: ${error.message}`
+      }
+    };
+    
+    return new Response(JSON.stringify(errorResponse), {
+      status: 400,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+      }
+    });
+  }
+}
+
+// Main Worker with Streamable HTTP support
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const { pathname } = new URL(request.url);
@@ -674,23 +758,13 @@ export default {
       }
     }
 
-    // Helper function to validate auth (dummy validation for public server)
-    const validateAuth = (request: Request): boolean => {
-      const authHeader = request.headers.get('Authorization');
-      if (!authHeader) return true; // Allow requests without auth for public server
-      
-      // Check for Bearer token format (dummy validation)
-      if (authHeader.startsWith('Bearer ')) {
-        const token = authHeader.substring(7);
-        return token.length > 10; // Dummy validation - just check it's not empty
-      }
-      
-      return false;
-    };
+    // MCP endpoint with Streamable HTTP transport
+    if (pathname === '/mcp' && request.method === 'POST') {
+      return handleStreamableHTTPRequest(request);
+    }
 
-    // Handle SSE endpoint
+    // Legacy SSE endpoint for backward compatibility (keep for mcp-remote)
     if (pathname.startsWith('/sse')) {
-      // Validate authentication
       if (!validateAuth(request)) {
         return new Response('Unauthorized', { 
           status: 401,
@@ -752,51 +826,6 @@ export default {
         }
       }
     }
-    
-    // Handle MCP endpoint (HTTP transport)
-    if (pathname.startsWith('/mcp') && request.method === 'POST') {
-      // Validate authentication
-      if (!validateAuth(request)) {
-        return new Response('Unauthorized', { 
-          status: 401,
-          headers: {
-            'WWW-Authenticate': 'Bearer',
-            'Access-Control-Allow-Origin': '*',
-          }
-        });
-      }
-
-      try {
-        const message = await request.json();
-        const response = await diceServer.handleMessage(message);
-        
-        return new Response(JSON.stringify(response), {
-          headers: {
-            'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-          }
-        });
-      } catch (error: any) {
-        const errorResponse = {
-          jsonrpc: "2.0",
-          id: null,
-          error: {
-            code: -32700,
-            message: `Parse error: ${error.message}`
-          }
-        };
-        
-        return new Response(JSON.stringify(errorResponse), {
-          status: 400,
-          headers: {
-            'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-          }
-        });
-      }
-    }
 
     // Health check endpoint for debugging
     if (pathname === '/health') {
@@ -804,7 +833,8 @@ export default {
         status: "healthy",
         timestamp: new Date().toISOString(),
         version: "2.0.0",
-        mcp_version: "2024-11-05"
+        mcp_version: "2024-11-05",
+        transport: "streamable-http"
       }), {
         headers: {
           'Content-Type': 'application/json',
@@ -819,13 +849,15 @@ export default {
         name: "Dice Rolling Server",
         version: "2.0.0",
         description: "A stateless Model Context Protocol server for rolling dice with advanced notation.",
+        transport: "streamable-http",
         endpoints: {
-          sse: `${baseUrl}/sse`,
           mcp: `${baseUrl}/mcp`,
+          sse: `${baseUrl}/sse`,
           oauth_discovery: `${baseUrl}/.well-known/oauth-authorization-server`,
           authorize: `${baseUrl}/oauth/authorize`,
           register: `${baseUrl}/register`,
-          token: `${baseUrl}/oauth/token`
+          token: `${baseUrl}/oauth/token`,
+          health: `${baseUrl}/health`
         },
         authentication: {
           type: "oauth2",
