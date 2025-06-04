@@ -154,6 +154,7 @@ export class SQLiteDurableObject {
       
       const encoder = new TextEncoder();
       let intervalId: number | null = null;
+      const db = this.db; // Capture db reference for closure
       
       const stream = new ReadableStream({
         async start(controller) {
@@ -165,7 +166,7 @@ export class SQLiteDurableObject {
           // Poll for new messages every second
           intervalId = setInterval(async () => {
             try {
-              const messages = await this.db.prepare(`
+              const messages = await db.prepare(`
                 SELECT id, message, timestamp 
                 FROM messages 
                 WHERE CAST(id AS INTEGER) > CAST(? AS INTEGER)
