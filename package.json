@@ -13,7 +13,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "latest",
     "agents": "latest",
-    "zod": "^3.22.4"
+    "zod": "^3.25.56"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240117.0",
